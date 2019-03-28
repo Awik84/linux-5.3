@@ -27,6 +27,7 @@
 #include <net/dst_metadata.h>
 
 #include <uapi/linux/netfilter/nf_conntrack_common.h>
+#include <net/tc_act/tc_ct.h>
 
 struct fl_flow_key {
 	struct flow_dissector_key_meta meta;
@@ -288,6 +289,45 @@ static u16 fl_ct_info_to_flower_map[] = {
 					TCA_FLOWER_KEY_CT_FLAGS_NEW,
 };
 
+static void fl_hw_notify_ct(const struct tcf_proto *tp, struct cls_fl_filter *f,
+			    struct sk_buff *skb, bool add)
+{
+	struct tcf_block *block = tp->chain->block;
+	const struct tcf_exts *exts = &f->exts;
+	const struct tc_action *act;
+	struct {
+		struct flow_cls_offload cls_flower;
+		struct sk_buff *skb;
+	} sel = {
+		.cls_flower = {},
+	};
+	bool found = false;
+	int i;
+
+	if (!tc_in_hw(f->flags))
+		return;
+
+	if (!exts)
+		return;
+
+	tcf_exts_for_each_action(i, act, exts) {
+		if (is_tcf_ct(act)) {
+			found = true;
+			break;
+		}
+	}
+	if (!found)
+		return;
+
+	tc_cls_common_offload_init(&sel.cls_flower.common, tp, f->flags, NULL);
+	sel.cls_flower.command = FLOW_CLS_MISS;
+	sel.cls_flower.cookie = (unsigned long) f;
+	sel.skb = skb;
+
+	//#warning "no notify"
+	tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &sel.cls_flower, false);
+}
+
 static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		       struct tcf_result *res)
 {
@@ -296,6 +336,7 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	struct fl_flow_key skb_key;
 	struct fl_flow_mask *mask;
 	struct cls_fl_filter *f;
+	int ret;
 
 	list_for_each_entry_rcu(mask, &head->masks, list) {
 		fl_clear_masked_range(&skb_key, mask);
@@ -316,7 +357,9 @@ static int fl_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 		f = fl_lookup(mask, &skb_mkey, &skb_key);
 		if (f && !tc_skip_sw(f->flags)) {
 			*res = f->res;
-			return tcf_exts_exec(skb, &f->exts, res);
+			ret = tcf_exts_exec(skb, &f->exts, res);
+			fl_hw_notify_ct(tp, f, skb, true);
+			return ret;
 		}
 	}
 	return -1;

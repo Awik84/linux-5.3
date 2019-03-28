@@ -324,6 +324,7 @@ enum flow_cls_command {
 	FLOW_CLS_STATS,
 	FLOW_CLS_TMPLT_CREATE,
 	FLOW_CLS_TMPLT_DESTROY,
+	FLOW_CLS_MISS,
 };
 
 struct flow_cls_common_offload {
