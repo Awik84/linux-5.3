@@ -61,6 +61,8 @@ struct mlx5_fc {
 	u32 id;
 	bool aging;
 
+	bool virtual;
+	struct mlx5_fc *parent;
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
 
@@ -129,11 +131,12 @@ static void mlx5_fc_stats_remove(struct mlx5_core_dev *dev,
 {
 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
 
-	list_del(&counter->list);
-
-	spin_lock(&fc_stats->counters_idr_lock);
-	WARN_ON(!idr_remove(&fc_stats->counters_idr, counter->id));
-	spin_unlock(&fc_stats->counters_idr_lock);
+	if (!counter->virtual) {
+		list_del(&counter->list);
+		spin_lock(&fc_stats->counters_idr_lock);
+		WARN_ON(!idr_remove(&fc_stats->counters_idr, counter->id));
+		spin_unlock(&fc_stats->counters_idr_lock);
+	}
 }
 
 /* The function returns the last counter that was queried so the caller
@@ -193,6 +196,14 @@ static struct mlx5_fc *mlx5_fc_stats_query(struct mlx5_core_dev *dev,
 		if (c->packets == packets)
 			continue;
 
+		if (counter->parent) {
+			struct mlx5_fc_cache *cp = &counter->parent->cache;
+
+			cp->packets += (packets - c->packets);
+			cp->bytes += (bytes - c->bytes);
+			cp->lastuse = jiffies;
+		}
+
 		c->packets = packets;
 		c->bytes = bytes;
 		c->lastuse = jiffies;
@@ -207,7 +218,8 @@ out:
 static void mlx5_free_fc(struct mlx5_core_dev *dev,
 			 struct mlx5_fc *counter)
 {
-	mlx5_cmd_fc_free(dev, counter->id);
+	if (!counter->virtual)
+		mlx5_cmd_fc_free(dev, counter->id);
 	kfree(counter);
 }
 
@@ -250,7 +262,8 @@ static void mlx5_fc_stats_work(struct work_struct *work)
 	fc_stats->next_query = now + fc_stats->sampling_interval;
 }
 
-struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
+static struct mlx5_fc *_mlx5_fc_create(struct mlx5_core_dev *dev, bool aging,
+				       struct mlx5_fc *parent, bool virtual)
 {
 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
 	struct mlx5_fc *counter;
@@ -260,10 +273,14 @@ struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
 	if (!counter)
 		return ERR_PTR(-ENOMEM);
 	INIT_LIST_HEAD(&counter->list);
+	counter->parent = parent;
+	counter->virtual = virtual;
 
-	err = mlx5_cmd_fc_alloc(dev, &counter->id);
-	if (err)
-		goto err_out;
+	if (!virtual) {
+		err = mlx5_cmd_fc_alloc(dev, &counter->id);
+		if (err)
+			goto err_out;
+	}
 
 	if (aging) {
 		u32 id = counter->id;
@@ -271,20 +288,22 @@ struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
 		counter->cache.lastuse = jiffies;
 		counter->aging = true;
 
-		idr_preload(GFP_KERNEL);
-		spin_lock(&fc_stats->counters_idr_lock);
+		if (!virtual) {
+			idr_preload(GFP_KERNEL);
+			spin_lock(&fc_stats->counters_idr_lock);
 
-		err = idr_alloc_u32(&fc_stats->counters_idr, counter, &id, id,
-				    GFP_NOWAIT);
+			err = idr_alloc_u32(&fc_stats->counters_idr, counter,
+					    &id, id, GFP_NOWAIT);
 
-		spin_unlock(&fc_stats->counters_idr_lock);
-		idr_preload_end();
-		if (err)
-			goto err_out_alloc;
+			spin_unlock(&fc_stats->counters_idr_lock);
+			idr_preload_end();
+			if (err)
+				goto err_out_alloc;
+			llist_add(&counter->addlist, &fc_stats->addlist);
 
-		llist_add(&counter->addlist, &fc_stats->addlist);
 
-		mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+			mod_delayed_work(fc_stats->wq, &fc_stats->work, 0);
+		}
 	}
 
 	return counter;
@@ -296,7 +315,25 @@ err_out:
 
 	return ERR_PTR(err);
 }
+
+struct mlx5_fc *mlx5_fc_create_linked(struct mlx5_core_dev *dev, bool aging,
+				      struct mlx5_fc *parent)
+{
+	return _mlx5_fc_create(dev, aging, parent, false);
+}
+EXPORT_SYMBOL(mlx5_fc_create_linked);
+
+struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging)
+{
+	return _mlx5_fc_create(dev, aging, NULL, false);
+}
 EXPORT_SYMBOL(mlx5_fc_create);
+
+struct mlx5_fc *mlx5_fc_create_virtual(struct mlx5_core_dev *dev, bool aging)
+{
+	return _mlx5_fc_create(dev, aging, NULL, true);
+}
+EXPORT_SYMBOL(mlx5_fc_create_virtual);
 
 u32 mlx5_fc_id(struct mlx5_fc *counter)
 {
@@ -365,14 +402,12 @@ void mlx5_cleanup_fc_stats(struct mlx5_core_dev *dev)
 int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
 		  u64 *packets, u64 *bytes)
 {
+	if (counter->virtual)
+		return -ENOENT;
+
 	return mlx5_cmd_fc_query(dev, counter->id, packets, bytes);
 }
 EXPORT_SYMBOL(mlx5_fc_query);
-
-u64 mlx5_fc_query_lastuse(struct mlx5_fc *counter)
-{
-	return counter->cache.lastuse;
-}
 
 void mlx5_fc_query_cached(struct mlx5_fc *counter,
 			  u64 *bytes, u64 *packets, u64 *lastuse)
@@ -387,6 +422,11 @@ void mlx5_fc_query_cached(struct mlx5_fc *counter,
 
 	counter->lastbytes = c.bytes;
 	counter->lastpackets = c.packets;
+}
+
+u64 mlx5_fc_query_cached_lastuse(struct mlx5_fc *counter)
+{
+	return counter->cache.lastuse;
 }
 
 void mlx5_fc_queue_stats_work(struct mlx5_core_dev *dev,

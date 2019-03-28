@@ -1136,7 +1136,7 @@ void mlx5e_tc_update_neigh_used_value(struct mlx5e_neigh_hash_entry *nhe)
 					    encaps[efi->index]);
 			if (flow_flag_test(flow, OFFLOADED)) {
 				counter = mlx5e_tc_get_counter(flow);
-				lastuse = mlx5_fc_query_lastuse(counter);
+				lastuse = mlx5_fc_query_cached_lastuse(counter);
 				if (time_after((unsigned long)lastuse, nhe->reported_lastuse)) {
 					neigh_used = true;
 					break;

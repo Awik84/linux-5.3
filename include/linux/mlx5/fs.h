@@ -222,10 +222,13 @@ int mlx5_modify_rule_destination(struct mlx5_flow_handle *handler,
 				 struct mlx5_flow_destination *old_dest);
 
 struct mlx5_fc *mlx5_fc_create(struct mlx5_core_dev *dev, bool aging);
+struct mlx5_fc *mlx5_fc_create_linked(struct mlx5_core_dev *dev, bool aging,
+				      struct mlx5_fc *parent);
+struct mlx5_fc *mlx5_fc_create_virtual(struct mlx5_core_dev *dev, bool aging);
 void mlx5_fc_destroy(struct mlx5_core_dev *dev, struct mlx5_fc *counter);
-u64 mlx5_fc_query_lastuse(struct mlx5_fc *counter);
 void mlx5_fc_query_cached(struct mlx5_fc *counter,
 			  u64 *bytes, u64 *packets, u64 *lastuse);
+u64 mlx5_fc_query_cached_lastuse(struct mlx5_fc *counter);
 int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
 		  u64 *packets, u64 *bytes);
 u32 mlx5_fc_id(struct mlx5_fc *counter);
