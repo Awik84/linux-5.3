@@ -35,5 +35,21 @@ int mlx5e_ct_restore_flow(struct mlx5_rep_uplink_priv *uplink_privuplink_priv,
 				 misc_parameters_2.metadata_reg_c_2),\
 }
 
+#define mp_mark_mapping {\
+	.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_3,\
+	.moffset = 0,\
+	.mlen = 4,\
+	.soffset = MLX5_BYTE_OFF(fte_match_param,\
+				 misc_parameters_2.metadata_reg_c_3),\
+}
+
+#define mp_labels_mapping {\
+	.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_4,\
+	.moffset = 0,\
+	.mlen = 4,\
+	.soffset = MLX5_BYTE_OFF(fte_match_param,\
+				 misc_parameters_2.metadata_reg_c_4),\
+}
+
 #define CT_REWRITE_ACTIONS 8
 #define MAX_TUPLE_ID 0x7FFF

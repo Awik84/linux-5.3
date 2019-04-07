@@ -1771,7 +1771,7 @@ static int parse_cls_flower(struct mlx5e_priv *priv,
 	inner_match_level = MLX5_MATCH_NONE;
 	outer_match_level = MLX5_MATCH_NONE;
 
-	err = __parse_cls_flower(priv, flow, spec, f, filter_dev, &match_level,
+	err = __parse_cls_flower(priv, flow, spec, f, filter_dev, &inner_match_level,
 				 &outer_match_level);
 	non_tunnel_match_level = (inner_match_level == MLX5_MATCH_NONE) ?
 				 outer_match_level : inner_match_level;
@@ -2290,7 +2290,7 @@ static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 	void *headers_v;
 	u16 ethertype;
 	u8 ip_proto;
-	int i;
+	int i, err;
 
 	headers_v = get_match_headers_value(actions, spec);
 	ethertype = MLX5_GET(fte_match_set_lyr_2_4, headers_v, ethertype);
@@ -2347,6 +2347,8 @@ static struct match_mapping_params match_mappings_arr[] = {
 					 misc_parameters_2.metadata_reg_c_5),
 	},
 	[mp_statezone] = mp_statezone_mapping,
+	[mp_mark] = mp_mark_mapping,
+	[mp_labels] = mp_labels_mapping,
 };
 
 struct match_mapping_params *match_mappings = match_mappings_arr;

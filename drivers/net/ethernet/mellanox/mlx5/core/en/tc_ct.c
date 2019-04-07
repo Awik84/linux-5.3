@@ -299,6 +299,7 @@ static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 {
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 	struct mlx5e_priv *priv = flow->priv;
+	struct nf_conn_labels *cl;
 	int num_actions, err;
 	char *actions;
 
@@ -310,6 +311,21 @@ static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 				       0xFFFF0000 | ct->zone.id, 0, true);
 	if (err)
 		return  err;
+
+	err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct, mp_mark,
+				       ct->mark, 0, true);
+	if (err)
+		return  err;
+
+	cl = nf_ct_labels_find(ct);
+	if (cl) {
+		uint32_t ct_labels[4];
+
+		err = get_direct_match_mapping(priv, &ct_flow->esw_attr_ct,
+					       mp_labels, ct_labels[0], 0, true);
+		if (err)
+			return err;
+	}
 
 	err = ct_flow_build_modhdr_nat(control, flow, ct_flow, ct, dir, tuple);
 	if (err)
@@ -388,7 +404,7 @@ static int ct_flow_add_tuple_match(struct mlx5e_tc_flow *flow,
 		headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
 					 outer_headers);
 	}
-	ct_flow->esw_attr_ct.match_level = MLX5_MATCH_L4;
+	ct_flow->esw_attr_ct.inner_match_level = MLX5_MATCH_L4;
 
 	if (tuple->src.l3num == NFPROTO_IPV4) {
 		if (!TUPLE_SET_MATCH(ethertype, cpu_to_be16(ETH_P_IP)))
@@ -907,6 +923,11 @@ int mlx5e_ct_parse_match(struct mlx5e_tc_flow *flow,
 
 	if (statezone_mask)
 		get_direct_match_mapping(priv, flow->esw_attr, mp_statezone, statezone, statezone_mask, false);
+	if (mask->ct_mark)
+		get_direct_match_mapping(priv, flow->esw_attr, mp_mark, key->ct_mark, mask->ct_mark, false);
+	if (memchr_inv(mask->ct_labels, 0, 16))
+		get_direct_match_mapping(priv, flow->esw_attr, mp_labels, key->ct_labels[0],
+					 mask->ct_labels[0], false);
 
 	return 0;
 }
