@@ -199,6 +199,95 @@ void mlx5e_ct_update_pkts(struct mlx5_fc_cb *cb, u64 packets, u64 bytes)
 	 * before deletion of all related ct_flows */
 }
 
+static int ct_flow_build_modhdr_nat(struct mlx5e_ct_control *control,
+				    struct mlx5e_tc_flow *flow,
+				    struct ct_flow *ct_flow,
+				    struct nf_conn *ct,
+				    enum ip_conntrack_dir dir,
+				    struct nf_conntrack_tuple *tuple)
+{
+	size_t action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
+	uint16_t ct_action = flow->esw_attr->ct_action;
+	struct mlx5e_tc_flow_parse_attr *parse_attr;
+	struct nf_conntrack_tuple target;
+	char *modact;
+
+	if (!(ct_action & TCA_CT_ACT_NAT))
+		return 0;
+
+	parse_attr = ct_flow->esw_attr_ct.parse_attr;
+	modact = parse_attr->mod_hdr_actions +
+		 parse_attr->num_mod_hdr_actions * action_size;
+
+	nf_ct_invert_tuple(&target, &ct->tuplehash[!dir].tuple);
+
+	/* SRC NAT:
+	 * orig  src=5.5.5.5 dst=5.5.5.6 sport=2001 dport=3002 (invert the other dir, target: src=5.5.5.7:8738, dst=5.5.5.6:3002)
+	 * reply src=5.5.5.6 dst=5.5.5.7 sport=3002 dport=8738 (invert the other dir, target: src=5.5.5.6:3002, dst=5.5.5.5:2001)
+	 */
+
+	if (memcmp(&target.src.u3, &tuple->src.u3, sizeof(target.src.u3))) {
+		printk(KERN_ERR "%s %d %s @@ ct: 5tuple: dir: %d, IPs %pI4, %pI4 ports %d, %d @ doing src nat to: [IPs %pI4, %pI4 ports %d, %d]\n",
+				__FILE__, __LINE__, __func__,
+				dir,
+				&tuple->src.u3.ip,
+				&tuple->dst.u3.ip,
+				ntohs(tuple->src.u.udp.port),
+				ntohs(tuple->dst.u.udp.port),
+				&target.src.u3.ip,
+				&target.dst.u3.ip,
+				ntohs(target.src.u.udp.port),
+				ntohs(target.dst.u.udp.port));
+
+		/* Need to change src to target src */
+		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_SIPV4);
+		MLX5_SET(set_action_in, modact, offset, 0);
+		MLX5_SET(set_action_in, modact, length, 32);
+		MLX5_SET(set_action_in, modact, data, htonl(target.src.u3.ip));
+		modact += action_size;
+		parse_attr->num_mod_hdr_actions++;
+
+		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_TCP_SPORT);
+		MLX5_SET(set_action_in, modact, offset, 0);
+		MLX5_SET(set_action_in, modact, length, 16);
+		MLX5_SET(set_action_in, modact, data, htons(target.src.u.tcp.port));
+		modact += action_size;
+		parse_attr->num_mod_hdr_actions++;
+	} else if (memcmp(&target.dst.u3, &tuple->dst.u3, sizeof(target.dst.u3))) {
+		printk(KERN_ERR "%s %d %s @@ ct: 5tuple: dir: %d, IPs %pI4, %pI4 ports %d, %d @ doing dst nat to: [IPs %pI4, %pI4 ports %d, %d]\n",
+				__FILE__, __LINE__, __func__,
+				dir,
+				&tuple->src.u3.ip,
+				&tuple->dst.u3.ip,
+				ntohs(tuple->src.u.udp.port),
+				ntohs(tuple->dst.u.udp.port),
+				&target.src.u3.ip,
+				&target.dst.u3.ip,
+				ntohs(target.src.u.udp.port),
+				ntohs(target.dst.u.udp.port));
+
+		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_DIPV4);
+		MLX5_SET(set_action_in, modact, offset, 0);
+		MLX5_SET(set_action_in, modact, length, 32);
+		MLX5_SET(set_action_in, modact, data, htonl(target.dst.u3.ip));
+		modact += action_size;
+		parse_attr->num_mod_hdr_actions++;
+
+		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+		MLX5_SET(set_action_in, modact, field, MLX5_ACTION_IN_FIELD_OUT_TCP_DPORT);
+		MLX5_SET(set_action_in, modact, offset, 0);
+		MLX5_SET(set_action_in, modact, length, 16);
+		MLX5_SET(set_action_in, modact, data, htons(target.dst.u.tcp.port));
+		modact += action_size;
+		parse_attr->num_mod_hdr_actions++;
+	}
+
+	return 0;
+}
+
 static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 				struct mlx5e_tc_flow *flow,
 				struct ct_flow *ct_flow,
@@ -221,6 +310,10 @@ static int ct_flow_build_modhdr(struct mlx5e_ct_control *control,
 				       0xFFFF0000 | ct->zone.id, 0, true);
 	if (err)
 		return  err;
+
+	err = ct_flow_build_modhdr_nat(control, flow, ct_flow, ct, dir, tuple);
+	if (err)
+		return err;
 
 	parse_attr = ct_flow->esw_attr_ct.parse_attr;
 	num_actions = parse_attr->num_mod_hdr_actions;
@@ -825,6 +918,7 @@ int mlx5e_ct_parse_action(struct mlx5e_tc_flow *flow,
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 
 	attr->zone = act->ct.zone;
+	attr->ct_action = act->ct.action;
 
 	return 0;
 }
