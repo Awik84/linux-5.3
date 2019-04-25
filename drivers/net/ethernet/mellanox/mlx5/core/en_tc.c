@@ -2380,6 +2380,18 @@ out_ok:
 	return true;
 }
 
+static struct match_mapping_params match_mappings_arr[] = {
+	[mp_chain] = {
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_0,
+		.moffset = 0,
+		.mlen = 2,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_0),
+	},
+};
+
+struct match_mapping_params *match_mappings = match_mappings_arr;
+
 static bool actions_match_supported(struct mlx5e_priv *priv,
 				    struct flow_action *flow_action,
 				    struct mlx5e_tc_flow_parse_attr *parse_attr,
@@ -3645,4 +3657,31 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work)
 			remove_unready_flow(flow);
 	}
 	rtnl_unlock();
+}
+
+int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1)
+{
+	struct tc_skb_ext *chainp;
+	struct mlx5_eswitch *esw;
+	u32 chain = 0;
+
+	if (!mlx5e_eswitch_rep(skb->dev))
+		return 0;
+
+	if (!reg_c0)
+		return 0;
+
+	chain = mlx5_eswitch_get_chain_for_tag(esw, reg_c0);
+	if (WARN_ON_ONCE(chain == 0))
+		return 0;
+
+	chainp = skb_ext_add(skb, TC_SKB_EXT);
+	if (!chainp) {
+		WARN_ON(1);
+		return 0;
+	}
+
+	chainp->chain = chain;
+
+	return 0;
 }

@@ -1025,6 +1025,7 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 	stats->packets++;
 	stats->bytes += cqe_bcnt;
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
+	mlx5e_update_skb(skb, (be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK), be32_to_cpu(cqe->imm_inval_pkey));
 }
 
 static inline

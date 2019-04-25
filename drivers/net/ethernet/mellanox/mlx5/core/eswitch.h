@@ -61,6 +61,7 @@
 #define FDB_MAX_CHAIN 3
 #define FDB_MAX_PRIO 16
 #define FDB_MAX_LEVEL 2
+#define FDB_MISS_PRIO (FDB_MAX_PRIO + 1)
 
 struct vport_ingress {
 	struct mlx5_flow_table *acl;
@@ -154,6 +155,7 @@ struct mlx5_eswitch_fdb {
 			struct mlx5_flow_handle *miss_rule_multi;
 			int vlan_push_pop_refcount;
 
+			struct idr chain_ids;
 			struct rhashtable fdb_chains_ht;
 			struct rhashtable fdb_prios_ht;
 			/* Protects fdb_chains */
@@ -166,6 +168,11 @@ struct mlx5_eswitch_fdb {
 };
 
 struct mlx5_esw_offload {
+	struct mlx5_flow_table *ft_offloads_restore;
+	struct mlx5_flow_group *restore_group;
+	struct mlx5_flow_handle **restore_rules;
+	int restore_copy_hdr_id;
+
 	struct mlx5_flow_table *ft_offloads;
 	struct mlx5_flow_group *vport_rx_group;
 	struct mlx5_eswitch_rep *vport_reps;
@@ -572,6 +579,7 @@ bool mlx5_eswitch_is_vf_vport(const struct mlx5_eswitch *esw, u16 vport_num);
 
 void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs);
 int mlx5_esw_funcs_changed_handler(struct notifier_block *nb, unsigned long type, void *data);
+u32 mlx5_eswitch_get_chain_for_tag(struct mlx5_eswitch *esw, u32 tag);
 
 #else  /* CONFIG_MLX5_ESWITCH */
 /* eswitch API stubs */
@@ -591,6 +599,7 @@ static inline void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, cons
 #define FDB_MAX_CHAIN 1
 #define FDB_MAX_PRIO 1
 #define FDB_MAX_LEVEL 1
+#define FDB_MISS_PRIO FDB_MAX_PRIO
 
 #endif /* CONFIG_MLX5_ESWITCH */
 
