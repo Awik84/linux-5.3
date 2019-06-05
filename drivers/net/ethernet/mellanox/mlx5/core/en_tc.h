@@ -65,6 +65,7 @@ enum {
 	MLX5E_TC_FLOW_FLAG_DUP,
 	MLX5E_TC_FLOW_FLAG_NOT_READY,
 	MLX5E_TC_FLOW_FLAG_DELETED,
+	MLX5E_TC_FLOW_FLAG_CT,
 };
 
 #define MLX5_TC_FLAG(flag) BIT(MLX5E_TC_FLOW_FLAG_##flag)
@@ -103,6 +104,7 @@ struct mlx5e_tc_flow {
 	 * The number of encaps is bounded by the number of supported
 	 * destinations.
 	 */
+	struct hlist_node ct_node;       /* Entry in hash of ct_flows */
 	struct encap_flow_item encaps[MLX5_MAX_FLOW_FWD_VPORTS];
 	struct mlx5e_tc_flow    *peer_flow;
 	struct list_head	mod_hdr; /* flows sharing the same mod hdr ID */
@@ -259,6 +261,8 @@ enum match_mapping_type {
 	mp_chain,
 	mp_tunnel_match,
 	mp_tunnel_miss,
+	mp_tupleid = mp_tunnel_miss,
+	mp_statezone,
 };
 
 struct match_mapping_params {
@@ -275,6 +279,12 @@ extern struct match_mapping_params *match_mappings;
 
 bool mlx5e_is_valid_eswitch_fwd_dev(struct mlx5e_priv *priv,
 				    struct net_device *out_dev);
+int get_direct_match_mapping(struct mlx5e_priv *priv,
+			     struct mlx5_esw_flow_attr *esw_attr,
+			     enum match_mapping_type type,
+			     u32 data,
+			     u32 mask,
+			     bool rewrite);
 
 #else /* CONFIG_MLX5_ESWITCH */
 static inline int  mlx5e_tc_nic_init(struct mlx5e_priv *priv) { return 0; }

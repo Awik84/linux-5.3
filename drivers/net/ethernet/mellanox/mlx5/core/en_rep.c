@@ -44,6 +44,7 @@
 #include "en_rep.h"
 #include "en_tc.h"
 #include "en/tc_tun.h"
+#include "en/tc_ct.h"
 #include "fs_core.h"
 #include "lib/port_tun.h"
 
@@ -673,6 +674,9 @@ mlx5e_rep_indr_offload(struct net_device *netdev,
 	case FLOW_CLS_STATS:
 		err = mlx5e_stats_flower(netdev, priv, flower, flags);
 		break;
+	case FLOW_CLS_MISS:
+		err = mlx5e_configure_ct(netdev, priv, flower, flags);
+		break;
 	default:
 		err = -EOPNOTSUPP;
 	}
@@ -1154,6 +1158,9 @@ mlx5e_rep_setup_tc_cls_flower(struct mlx5e_priv *priv,
 					   flags);
 	case FLOW_CLS_STATS:
 		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
+					  flags);
+	case FLOW_CLS_MISS:
+		return mlx5e_configure_ct(priv->netdev, priv, cls_flower,
 					  flags);
 	default:
 		return -EOPNOTSUPP;

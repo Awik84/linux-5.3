@@ -2660,6 +2660,8 @@ static int esw_create_offloads_acl_tables(struct mlx5_eswitch *esw)
 
 	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
 		esw_info(esw->dev, "Use metadata reg_c as source vport to match\n");
+	else
+		esw_info(esw->dev, "No metadata supported, Connection tracking won't be supported.\n");
 
 	return 0;
 

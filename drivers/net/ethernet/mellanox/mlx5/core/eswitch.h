@@ -390,6 +390,8 @@ struct mlx5_esw_flow_attr {
 	u16	prio;
 	u32	dest_chain;
 	bool slow_path;
+	uint16_t zone;
+	uint32_t tunnel_id;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 };
 
