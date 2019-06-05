@@ -233,6 +233,12 @@ int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
 		  u64 *packets, u64 *bytes);
 u32 mlx5_fc_id(struct mlx5_fc *counter);
 
+struct mlx5_fc_cb {
+	void (*updated)(struct mlx5_fc_cb *cb, u64 packets, u64 bytes);
+};
+
+void mlx5_fc_register_set_cb(struct mlx5_fc *counter, struct mlx5_fc_cb *cb);
+
 int mlx5_fs_add_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn);
 int mlx5_fs_remove_rx_underlay_qpn(struct mlx5_core_dev *dev, u32 underlay_qpn);
 

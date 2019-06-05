@@ -63,6 +63,7 @@ struct mlx5_fc {
 
 	bool virtual;
 	struct mlx5_fc *parent;
+	struct mlx5_fc_cb *cb;
 	struct mlx5_fc_cache cache ____cacheline_aligned_in_smp;
 };
 
@@ -202,11 +203,17 @@ static struct mlx5_fc *mlx5_fc_stats_query(struct mlx5_core_dev *dev,
 			cp->packets += (packets - c->packets);
 			cp->bytes += (bytes - c->bytes);
 			cp->lastuse = jiffies;
+
+			if (counter->parent->cb)
+				counter->parent->cb->updated(counter->parent->cb, cp->packets, cp->bytes);
 		}
 
 		c->packets = packets;
 		c->bytes = bytes;
 		c->lastuse = jiffies;
+
+		if (counter->cb)
+			counter->cb->updated(counter->cb, packets, bytes);
 	}
 
 out:
@@ -408,6 +415,12 @@ int mlx5_fc_query(struct mlx5_core_dev *dev, struct mlx5_fc *counter,
 	return mlx5_cmd_fc_query(dev, counter->id, packets, bytes);
 }
 EXPORT_SYMBOL(mlx5_fc_query);
+
+void mlx5_fc_register_set_cb(struct mlx5_fc *counter, struct mlx5_fc_cb *cb)
+{
+	counter->cb = cb;
+}
+EXPORT_SYMBOL(mlx5_fc_register_set_cb);
 
 void mlx5_fc_query_cached(struct mlx5_fc *counter,
 			  u64 *bytes, u64 *packets, u64 *lastuse)
