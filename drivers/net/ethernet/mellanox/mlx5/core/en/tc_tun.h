@@ -18,6 +18,18 @@ enum {
 	MLX5E_TC_TUNNEL_TYPE_GRETAP,
 };
 
+struct tunnel_match_key {
+	struct flow_dissector_key_control enc_control;
+	struct flow_dissector_key_keyid enc_key_id;
+	struct flow_dissector_key_ports enc_tp;
+	struct flow_dissector_key_ip enc_ip;
+	struct flow_dissector_key_enc_opts enc_opts;
+	union {
+		struct flow_dissector_key_ipv4_addrs enc_ipv4;
+		struct flow_dissector_key_ipv6_addrs enc_ipv6;
+	};
+};
+
 struct mlx5e_tc_tunnel {
 	int tunnel_type;
 	enum mlx5_flow_match_level match_level;

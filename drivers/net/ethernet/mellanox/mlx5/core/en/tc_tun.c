@@ -457,6 +457,9 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
 		       void *headers_v, u8 *match_level)
 {
 	struct mlx5e_tc_tunnel *tunnel = mlx5e_get_tc_tun(filter_dev);
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct netlink_ext_ack *extack = f->common.extack;
+	struct flow_match_control enc_control;
 	int err = 0;
 
 	if (!tunnel) {
@@ -481,6 +484,78 @@ int mlx5e_tc_tun_parse(struct net_device *filter_dev,
 					   headers_c, headers_v);
 		if (err)
 			goto out;
+	}
+
+	flow_rule_match_enc_control(rule, &enc_control);
+	if (enc_control.key->addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS) {
+		struct flow_match_ipv4_addrs match;
+
+		flow_rule_match_enc_ipv4_addrs(rule, &match);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c,
+			 src_ipv4_src_ipv6.ipv4_layout.ipv4,
+			 ntohl(match.mask->src));
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 src_ipv4_src_ipv6.ipv4_layout.ipv4,
+			 ntohl(match.key->src));
+
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c,
+			 dst_ipv4_dst_ipv6.ipv4_layout.ipv4,
+			 ntohl(match.mask->dst));
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
+			 dst_ipv4_dst_ipv6.ipv4_layout.ipv4,
+			 ntohl(match.key->dst));
+
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ethertype);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype, ETH_P_IP);
+	} else if (enc_control.key->addr_type == FLOW_DISSECTOR_KEY_IPV6_ADDRS) {
+		struct flow_match_ipv6_addrs match;
+
+		flow_rule_match_enc_ipv6_addrs(rule, &match);
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
+				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+		       &match.mask->src, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
+		       &match.key->src, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
+
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
+				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+		       &match.mask->dst, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
+		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
+		       &match.key->dst, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
+
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ethertype);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype, ETH_P_IPV6);
+	}
+
+	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IP)) {
+		struct flow_match_ip match;
+
+		flow_rule_match_enc_ip(rule, &match);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_ecn,
+			 match.mask->tos & 0x3);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_ecn,
+			 match.key->tos & 0x3);
+
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_dscp,
+			 match.mask->tos >> 2);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_dscp,
+			 match.key->tos  >> 2);
+
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ttl_hoplimit,
+			 match.mask->ttl);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ttl_hoplimit,
+			 match.key->ttl);
+
+		if (match.mask->ttl &&
+		    !MLX5_CAP_ESW_FLOWTABLE_FDB
+			(priv->mdev,
+			 ft_field_support.outer_ipv4_ttl)) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "Matching on TTL is not supported");
+			return -EOPNOTSUPP;
+		}
 	}
 
 out:

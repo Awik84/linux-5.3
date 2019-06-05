@@ -80,7 +80,8 @@ int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
 
 enum match_mapping_type {
 	mp_chain,
-	mp_tunnel,
+	mp_tunnel_match,
+	mp_tunnel_miss,
 };
 
 struct match_mapping_params {

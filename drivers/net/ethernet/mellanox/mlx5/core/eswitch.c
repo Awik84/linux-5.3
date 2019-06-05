@@ -1933,6 +1933,7 @@ int mlx5_eswitch_init(struct mlx5_core_dev *dev)
 
 	hash_init(esw->offloads.encap_tbl);
 	hash_init(esw->offloads.mod_hdr_tbl);
+	hash_init(esw->offloads.tunnel_tbl);
 	mutex_init(&esw->state_lock);
 
 	mlx5_esw_for_all_vports(esw, i, vport) {

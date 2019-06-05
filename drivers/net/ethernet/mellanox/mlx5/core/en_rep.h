@@ -77,6 +77,8 @@ struct mlx5_rep_uplink_priv {
 
 	struct list_head            unready_flows;
 	struct work_struct          reoffload_flows_work;
+
+	struct idr tunnel_ids;
 };
 
 struct mlx5e_rep_priv {

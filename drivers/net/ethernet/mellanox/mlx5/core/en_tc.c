@@ -120,6 +120,7 @@ struct mlx5e_tc_flow {
 	struct list_head	hairpin; /* flows sharing the same hairpin */
 	struct list_head	peer;    /* flows with peer flow */
 	struct list_head	unready; /* flows not ready to be offloaded (e.g due to missing route) */
+	struct list_head        tunnel;  /* flows sharing the same tunnel match */
 	union {
 		struct mlx5_esw_flow_attr esw_attr[0];
 		struct mlx5_nic_flow_attr nic_attr[0];
@@ -1083,6 +1084,8 @@ static bool mlx5_flow_has_geneve_opt(struct mlx5e_tc_flow *flow)
 	return !!geneve_tlv_opt_0_data;
 }
 
+static void put_tunnel_mapping(struct mlx5e_priv *priv,
+			       struct mlx5e_tc_flow *flow);
 static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 				  struct mlx5e_tc_flow *flow)
 {
@@ -1090,6 +1093,8 @@ static void mlx5e_tc_del_fdb_flow(struct mlx5e_priv *priv,
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 	struct mlx5_esw_flow_attr slow_attr;
 	int out_index;
+
+	put_tunnel_mapping(priv, flow);
 
 	if (flow->flags & MLX5E_TC_FLOW_NOT_READY) {
 		remove_unready_flow(flow);
@@ -1350,8 +1355,52 @@ static void mlx5e_tc_del_flow(struct mlx5e_priv *priv,
 	}
 }
 
+static int is_simple_flow(struct mlx5e_tc_flow *flow, struct flow_rule *rule,
+			  bool *decap)
+{
+	struct mlx5_eswitch *esw = flow->priv->mdev->priv.eswitch;
+	struct flow_action *flow_action = &rule->action;
+	const struct flow_action_entry *act;
+	bool simple = true;
+	int i;
 
+	*decap = false;
+
+	flow_action_for_each(i, act, flow_action) {
+		switch (act->id) {
+			case FLOW_ACTION_GOTO:
+				simple = false;
+			break;
+			case FLOW_ACTION_TUNNEL_DECAP:
+				*decap = true;
+			break;
+			default:
+			break;
+		}
+	}
+
+	if (!mlx5e_is_eswitch_flow(flow))
+		return true;
+
+	/* If metadata isn't supported, we still wan't to support full
+	 * matching with chain to not cause a regression, count it as
+	 * simple rules
+	 */
+	if (!mlx5_eswitch_vport_match_metadata_enabled(esw))
+		return true;
+
+	if (flow->esw_attr->chain)
+		return false;
+
+	return simple;
+}
+
+static int get_tunnel_mapping(struct mlx5e_priv *priv,
+			      struct mlx5e_tc_flow *flow,
+			      struct tunnel_match_key *key,
+			      struct netlink_ext_ack *extack);
 static int parse_tunnel_attr(struct mlx5e_priv *priv,
+			     struct mlx5e_tc_flow *flow,
 			     struct mlx5_flow_spec *spec,
 			     struct flow_cls_offload *f,
 			     struct net_device *filter_dev, u8 *match_level)
@@ -1362,99 +1411,68 @@ static int parse_tunnel_attr(struct mlx5e_priv *priv,
 	void *headers_v = MLX5_ADDR_OF(fte_match_param, spec->match_value,
 				       outer_headers);
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct tunnel_match_key tunnel_key;
+	bool simple_flow, decap;
 	int err;
 
-	err = mlx5e_tc_tun_parse(filter_dev, priv, spec, f,
-				 headers_c, headers_v, match_level);
-	if (err) {
-		NL_SET_ERR_MSG_MOD(extack,
-				   "failed to parse tunnel attributes");
-		return err;
-	}
-
-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS)) {
-		struct flow_match_ipv4_addrs match;
-
-		flow_rule_match_enc_ipv4_addrs(rule, &match);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c,
-			 src_ipv4_src_ipv6.ipv4_layout.ipv4,
-			 ntohl(match.mask->src));
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
-			 src_ipv4_src_ipv6.ipv4_layout.ipv4,
-			 ntohl(match.key->src));
-
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c,
-			 dst_ipv4_dst_ipv6.ipv4_layout.ipv4,
-			 ntohl(match.mask->dst));
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v,
-			 dst_ipv4_dst_ipv6.ipv4_layout.ipv4,
-			 ntohl(match.key->dst));
-
-		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ethertype);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype, ETH_P_IP);
-	} else if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS)) {
-		struct flow_match_ipv6_addrs match;
-
-		flow_rule_match_enc_ipv6_addrs(rule, &match);
-		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
-				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
-		       &match.mask->src, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
-		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
-				    src_ipv4_src_ipv6.ipv6_layout.ipv6),
-		       &match.key->src, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
-
-		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_c,
-				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
-		       &match.mask->dst, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
-		memcpy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
-				    dst_ipv4_dst_ipv6.ipv6_layout.ipv6),
-		       &match.key->dst, MLX5_FLD_SZ_BYTES(ipv6_layout, ipv6));
-
-		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, ethertype);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ethertype, ETH_P_IPV6);
-	}
-
-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IP)) {
-		struct flow_match_ip match;
-
-		flow_rule_match_enc_ip(rule, &match);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_ecn,
-			 match.mask->tos & 0x3);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_ecn,
-			 match.key->tos & 0x3);
-
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ip_dscp,
-			 match.mask->tos >> 2);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ip_dscp,
-			 match.key->tos  >> 2);
-
-		MLX5_SET(fte_match_set_lyr_2_4, headers_c, ttl_hoplimit,
-			 match.mask->ttl);
-		MLX5_SET(fte_match_set_lyr_2_4, headers_v, ttl_hoplimit,
-			 match.key->ttl);
-
-		if (match.mask->ttl &&
-		    !MLX5_CAP_ESW_FLOWTABLE_FDB
-			(priv->mdev,
-			 ft_field_support.outer_ipv4_ttl)) {
+	simple_flow = is_simple_flow(flow, rule, &decap);
+	/* we don't fill spec for eswitch later rules or simple flows */
+	if (simple_flow || !flow->esw_attr->chain) {
+		err = mlx5e_tc_tun_parse(filter_dev, priv, spec, f,
+					 headers_c, headers_v, match_level);
+		if (err) {
 			NL_SET_ERR_MSG_MOD(extack,
-					   "Matching on TTL is not supported");
-			return -EOPNOTSUPP;
+					   "failed to parse tunnel attributes");
+			return err;
 		}
 
+
+		/* Enforce DMAC when offloading incoming tunneled flows.
+		 * Flow counters require a match on the DMAC.
+		 */
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, dmac_47_16);
+		MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, dmac_15_0);
+		ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
+					     dmac_47_16), priv->netdev->dev_addr);
+
+		/* let software handle IP fragments */
+		MLX5_SET(fte_match_set_lyr_2_4, headers_c, frag, 1);
+		MLX5_SET(fte_match_set_lyr_2_4, headers_v, frag, 0);
+
+		/* Simple rule, done here */
+		if (simple_flow)
+			return 0;
 	}
 
-	/* Enforce DMAC when offloading incoming tunneled flows.
-	 * Flow counters require a match on the DMAC.
-	 */
-	MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, dmac_47_16);
-	MLX5_SET_TO_ONES(fte_match_set_lyr_2_4, headers_c, dmac_15_0);
-	ether_addr_copy(MLX5_ADDR_OF(fte_match_set_lyr_2_4, headers_v,
-				     dmac_47_16), priv->netdev->dev_addr);
+	/* if we decap, we don't rewrite the tunnel metadata register
+	 * via get_tunnel_mapping()
+	 * */
+	if (decap)
+		return 0;
 
-	/* let software handle IP fragments */
-	MLX5_SET(fte_match_set_lyr_2_4, headers_c, frag, 1);
-	MLX5_SET(fte_match_set_lyr_2_4, headers_v, frag, 0);
+	memset(&tunnel_key, 0, sizeof(tunnel_key));
+
+#define COPY_DISSECTOR_KEY(rule, diss_key, field)\
+	memcpy(&tunnel_key.field,\
+	       skb_flow_dissector_target(rule->match.dissector,\
+					 diss_key,\
+					 rule->match.key),\
+	       sizeof(tunnel_key.field))
+
+	// need to check ? if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_IP)) {
+	COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_CONTROL, enc_control);
+	if (tunnel_key.enc_control.addr_type == FLOW_DISSECTOR_KEY_IPV4_ADDRS)
+		COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS, enc_ipv4);
+	else
+		COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS, enc_ipv6);
+	COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_IP, enc_ip);
+	COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_PORTS, enc_tp);
+	COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_OPTS, enc_opts);
+	COPY_DISSECTOR_KEY(rule, FLOW_DISSECTOR_KEY_ENC_KEYID, enc_key_id);
+
+	err = get_tunnel_mapping(priv, flow, &tunnel_key, extack);
+	if (err)
+		return err;
 
 	return 0;
 }
@@ -1480,6 +1498,7 @@ static void *get_match_headers_value(u32 flags,
 }
 
 static int __parse_cls_flower(struct mlx5e_priv *priv,
+			      struct mlx5e_tc_flow *flow,
 			      struct mlx5_flow_spec *spec,
 			      struct flow_cls_offload *f,
 			      struct net_device *filter_dev,
@@ -1528,18 +1547,21 @@ static int __parse_cls_flower(struct mlx5e_priv *priv,
 	}
 
 	if (mlx5e_get_tc_tun(filter_dev)) {
-		if (parse_tunnel_attr(priv, spec, f, filter_dev,
-				      outer_match_level))
+		bool write = f->common.chain_index ? false : true;
+
+		if (parse_tunnel_attr(priv, flow, spec, f, filter_dev, outer_match_level))
 			return -EOPNOTSUPP;
 
 		/* At this point, header pointers should point to the inner
 		 * headers, outer header were already set by parse_tunnel_attr
 		 */
 		match_level = inner_match_level;
-		headers_c = get_match_headers_criteria(MLX5_FLOW_CONTEXT_ACTION_DECAP,
-						       spec);
-		headers_v = get_match_headers_value(MLX5_FLOW_CONTEXT_ACTION_DECAP,
-						    spec);
+		if (write) {
+			headers_c = get_match_headers_criteria(MLX5_FLOW_CONTEXT_ACTION_DECAP,
+							       spec);
+			headers_v = get_match_headers_value(MLX5_FLOW_CONTEXT_ACTION_DECAP,
+							    spec);
+		}
 	}
 
 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC)) {
@@ -1848,7 +1870,7 @@ static int parse_cls_flower(struct mlx5e_priv *priv,
 	inner_match_level = MLX5_MATCH_NONE;
 	outer_match_level = MLX5_MATCH_NONE;
 
-	err = __parse_cls_flower(priv, spec, f, filter_dev, &inner_match_level,
+	err = __parse_cls_flower(priv, flow, spec, f, filter_dev, &match_level,
 				 &outer_match_level);
 	non_tunnel_match_level = (inner_match_level == MLX5_MATCH_NONE) ?
 				 outer_match_level : inner_match_level;
@@ -2388,9 +2410,217 @@ static struct match_mapping_params match_mappings_arr[] = {
 		.soffset = MLX5_BYTE_OFF(fte_match_param,
 					 misc_parameters_2.metadata_reg_c_0),
 	},
+	[mp_tunnel_miss] = { /* and mp_tupleid */
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_1,
+		.moffset = 0,
+		.mlen = 4,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_1),
+	},
+	[mp_tunnel_match] = {
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_5,
+		.moffset = 0,
+		.mlen = 4,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_5),
+	},
 };
 
 struct match_mapping_params *match_mappings = match_mappings_arr;
+
+static int
+get_direct_match_mapping(struct mlx5e_priv *priv,
+			 struct mlx5_esw_flow_attr *attr,
+			 enum match_mapping_type type,
+			 u32 data,
+			 u32 mask,
+			 bool rewrite)
+{
+	struct mlx5_flow_spec *spec = &attr->parse_attr->spec;
+	int moffset = match_mappings[type].moffset;
+	int soffset = match_mappings[type].soffset;
+	int mfield = match_mappings[type].mfield;
+	void *headers_c = spec->match_criteria;
+	void *headers_v = spec->match_value;
+	int mlen = match_mappings[type].mlen;
+
+	if (rewrite) {
+		size_t action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
+		struct mlx5e_tc_flow_parse_attr *parse_attr = attr->parse_attr;
+		char *modact;
+		int err;
+
+		if (!parse_attr->mod_hdr_actions) {
+			err = alloc_mod_hdr_actions(priv, NULL,
+						    MLX5_FLOW_NAMESPACE_FDB,
+						    parse_attr);
+			if (err)
+				return err;
+		} else if (parse_attr->num_mod_hdr_actions == parse_attr->max_mod_hdr_actions) {
+			return -ENOSPC;
+		}
+
+		modact = parse_attr->mod_hdr_actions +
+			 parse_attr->num_mod_hdr_actions * action_size;
+
+		if (mlen == 4)
+			mlen = 0;
+
+		MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+		MLX5_SET(set_action_in, modact, field, mfield);
+		MLX5_SET(set_action_in, modact, offset, moffset*8);
+		MLX5_SET(set_action_in, modact, length, mlen*8);
+		MLX5_SET(set_action_in, modact, data, data);
+		parse_attr->num_mod_hdr_actions++;
+	} else {
+		char *fmask = headers_c + soffset;
+		char *fval = headers_v + soffset;
+
+		mask = cpu_to_be32(mask);
+		data = cpu_to_be32(data);
+		memcpy(fmask, &mask, mlen);
+		memcpy(fval, &data, mlen);
+
+		spec->match_criteria_enable |= MLX5_MATCH_MISC_PARAMETERS_2;
+	}
+
+	return 0;
+}
+
+struct tunnel_mapping {
+	struct tunnel_match_key key;
+	struct hlist_node tunnel_hlist;
+
+	struct list_head flows; /* struct mlx5e_tc_flow *flow */
+	int encap_id;
+	int mod_hdr_id;
+	u32 match_id;
+	struct flow_dissector_key_enc_opts enc_opts;
+
+	struct net_device *dev;
+};
+
+static int get_tunnel_mapping(struct mlx5e_priv *priv,
+			      struct mlx5e_tc_flow *flow,
+			      struct tunnel_match_key *key,
+			      struct netlink_ext_ack *extack)
+{
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	struct tunnel_mapping *mp;
+	bool found = false;
+	int index = 0, err;
+	size_t action_size;
+	u32 hash_key;
+
+	action_size = MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto);
+	/*
+	print_hex_dump(KERN_ERR, "key: ", DUMP_PREFIX_ADDRESS,
+			16, 1, key, sizeof(*key), true);
+	*/
+	hash_key = jhash(key, sizeof(*key), 0);
+	if (flow->esw_attr->chain) {
+		if (key->enc_opts.len) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "later chains with enc_opts matching isn't supported");
+			return -EOPNOTSUPP;
+		}
+		memset(&key->enc_opts, 0, sizeof(key->enc_opts));
+		hash_key = jhash(key, sizeof(*key), 0);
+		printk(KERN_ERR "%s %d %s @@ searcing...., opts_len: %d, hash: %d\n", __FILE__, __LINE__, __func__, key->enc_opts.len, hash_key);
+
+		/* actually we check that both key and mask are the same. */
+		hash_for_each_possible(esw->offloads.tunnel_tbl, mp,
+				       tunnel_hlist, hash_key) {
+			if (!memcmp(&mp->key, key, sizeof(*key))) {
+				found = true;
+				break;
+			}
+		}
+
+		/* later flows must find */
+		if (!found) {
+			NL_SET_ERR_MSG_MOD(extack,
+					   "later chains with different outer match isn't supported");
+			return -EOPNOTSUPP;
+		}
+		printk(KERN_ERR "%s %d %s @@ found match id: %d, attaching.\n", __FILE__, __LINE__, __func__, mp->match_id);
+		goto attach_flow;
+	}
+
+	printk(KERN_ERR "%s %d %s @@ creating tunnel maping...\n", __FILE__, __LINE__, __func__);
+
+	mp = kzalloc(sizeof(*mp), GFP_KERNEL);
+	if (!mp)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&mp->flows);
+	mp->dev = flow->esw_attr->parse_attr->filter_dev;
+
+	/* We don't support enc_opts on later keys, so we copy it to a different
+	 * member, and we hash without it */
+	memcpy(&mp->key, key, sizeof(*key));
+	memcpy(&mp->enc_opts, &key->enc_opts, sizeof(key->enc_opts));
+	memset(&mp->key.enc_opts, 0, sizeof(key->enc_opts));
+	hash_key = jhash(&mp->key, sizeof(mp->key), 0);
+
+	index = 1;
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+	err = idr_alloc_u32(&uplink_priv->tunnel_ids, mp, &index, 0xFFFF,
+			    GFP_KERNEL);
+	if (err)
+		goto out_err_idr;
+	mp->match_id = index;
+
+	hash_add(esw->offloads.tunnel_tbl, &mp->tunnel_hlist, hash_key);
+
+	printk(KERN_ERR "%s %d %s @@ created: %d (on tunnel_ids: %px), hash: %d, opts_len: %d\n", __FILE__, __LINE__, __func__, mp->match_id, &uplink_priv->tunnel_ids, hash_key, key->enc_opts.len);
+
+attach_flow:
+	printk(KERN_ERR "%s %d %s @@ mp: %px attached flow: %px, using match id: %d\n", __FILE__, __LINE__, __func__, mp, flow, mp->match_id);
+	list_add(&flow->tunnel, &mp->flows);
+
+	if (!found)
+		get_direct_match_mapping(priv, flow->esw_attr, mp_tunnel_miss,
+					 mp->match_id, 0xFFFFFFFF, true);
+	get_direct_match_mapping(priv, flow->esw_attr, mp_tunnel_match,
+			mp->match_id, 0xFFFFFFFF, !found);
+
+	return err;
+
+out_err_idr:
+	kfree(mp);
+	return err;
+}
+
+static void put_tunnel_mapping(struct mlx5e_priv *priv,
+			       struct mlx5e_tc_flow *flow)
+{
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct list_head *next = flow->tunnel.next;
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	struct tunnel_mapping *mp;
+
+	if (!flow || list_empty(&flow->tunnel))
+		return;
+
+	list_del(&flow->tunnel);
+
+	if (!list_empty(next))
+		return;
+
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+	mp = list_entry(next, struct tunnel_mapping, flows);
+
+	printk(KERN_ERR "%s %d %s @@ mp: %px, flow: %px, put tunnel mapping id %d, cleanup (tunnel_ids: %px)\n", __FILE__, __LINE__, __func__, mp, flow, mp->match_id, &uplink_priv->tunnel_ids);
+
+	idr_remove(&uplink_priv->tunnel_ids, mp->match_id);
+	kfree(mp);
+}
 
 static bool actions_match_supported(struct mlx5e_priv *priv,
 				    struct flow_action *flow_action,
@@ -2398,17 +2628,22 @@ static bool actions_match_supported(struct mlx5e_priv *priv,
 				    struct mlx5e_tc_flow *flow,
 				    struct netlink_ext_ack *extack)
 {
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	u32 actions;
 
-	if (flow->flags & MLX5E_TC_FLOW_ESWITCH)
+	if (mlx5e_is_eswitch_flow(flow)) {
 		actions = flow->esw_attr->action;
-	else
+		/* TODO: need to check all calls to get_match_headers_criteria and see if they
+		 * make sense with chains and not actually decap */
+		if (actions & MLX5_FLOW_CONTEXT_ACTION_DECAP &&
+		    flow->esw_attr->dest_chain &&
+		    !mlx5_eswitch_vport_match_metadata_enabled(esw)) {
+			NL_SET_ERR_MSG(extack, "Decap and goto isn't supported without register metadata support");
+			return -EOPNOTSUPP;
+		}
+	} else {
 		actions = flow->nic_attr->action;
-
-	if (flow->flags & MLX5E_TC_FLOW_EGRESS &&
-	    !((actions & MLX5_FLOW_CONTEXT_ACTION_DECAP) ||
-	      (actions & MLX5_FLOW_CONTEXT_ACTION_VLAN_POP)))
-		return false;
+	}
 
 	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
 		return modify_header_match_supported(&parse_attr->spec,
@@ -3203,6 +3438,7 @@ __mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 		     struct mlx5_core_dev *in_mdev)
 {
 	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
+	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 	struct mlx5e_tc_flow *flow;
@@ -3228,6 +3464,12 @@ __mlx5e_add_fdb_flow(struct mlx5e_priv *priv,
 	err = parse_tc_fdb_actions(priv, &rule->action, flow, extack);
 	if (err)
 		goto err_free;
+
+	if (flow_flag_test(flow, EGRESS) && !flow->esw_attr->chain &&
+	    mlx5_eswitch_vport_match_metadata_enabled(esw)) {
+		flow->esw_attr->action |= MLX5_FLOW_CONTEXT_ACTION_DECAP;
+		printk(KERN_ERR "%s %d %s @@ egress flow: %px, implicit decap, actions: %d\n", __FILE__, __LINE__, __func__, flow, flow->esw_attr->action);
+	}
 
 	err = mlx5e_tc_add_fdb_flow(priv, flow, extack);
 	if (err) {
@@ -3621,11 +3863,21 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv)
 
 int mlx5e_tc_esw_init(struct rhashtable *tc_ht)
 {
+	struct mlx5_rep_uplink_priv *uplink_priv;
+
+	uplink_priv = container_of(tc_ht, struct mlx5_rep_uplink_priv, tc_ht);
+	idr_init(&uplink_priv->tunnel_ids);
+
 	return rhashtable_init(tc_ht, &tc_ht_params);
 }
 
 void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht)
 {
+	struct mlx5_rep_uplink_priv *uplink_priv;
+
+	uplink_priv = container_of(tc_ht, struct mlx5_rep_uplink_priv, tc_ht);
+	idr_destroy(&uplink_priv->tunnel_ids);
+
 	rhashtable_free_and_destroy(tc_ht, _mlx5e_tc_del_flow, NULL);
 }
 
@@ -3659,17 +3911,69 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work)
 	rtnl_unlock();
 }
 
+static int mlx5e_restore_tunnel(struct mlx5_rep_uplink_priv *uplink_priv,
+				struct sk_buff *skb, u32 tunnel_id)
+{
+	struct tunnel_match_key *key;
+	struct metadata_dst *tun_dst;
+	struct tunnel_mapping *mp;
+
+	mp = idr_find(&uplink_priv->tunnel_ids, tunnel_id);
+	if (!mp) {
+		printk(KERN_ERR "%s %d %s @@ skb: %pxb, tunnel: %d failed\n", __FILE__, __LINE__, __func__, skb, tunnel_id);
+		return 0;
+	}
+	key = &mp->key;
+
+	tun_dst = tun_rx_dst(mp->enc_opts.len);
+	if (!tun_dst) {
+		WARN_ON(1);
+		return -ENOMEM;
+	}
+
+	ip_tunnel_key_init(&tun_dst->u.tun_info.key,
+			   key->enc_ipv4.src, key->enc_ipv4.dst, /* ip */
+			   0, 64, /* tos, ttl */
+			   0, /* label */
+			   key->enc_tp.src, key->enc_tp.dst, /* ports */
+			   key32_to_tunnel_id(key->enc_key_id.keyid),//ntohl(key->enc_key_id.keyid)),
+			   TUNNEL_KEY);
+
+	if (mp->enc_opts.len) {
+		ip_tunnel_info_opts_set(&tun_dst->u.tun_info,
+					mp->enc_opts.data,
+					mp->enc_opts.len,
+					mp->enc_opts.dst_opt_type);
+	}
+
+	skb_dst_set(skb, (struct dst_entry *)tun_dst);
+	skb->dev = mp->dev;
+
+	return 0;
+}
+
 int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1)
 {
+	struct mlx5_rep_uplink_priv *uplink_priv;
+	struct mlx5e_rep_priv *uplink_rpriv;
+	u32 chain = 0, tunnel_id = 0;
 	struct tc_skb_ext *chainp;
 	struct mlx5_eswitch *esw;
-	u32 chain = 0;
+	struct mlx5e_priv *priv;
 
 	if (!mlx5e_eswitch_rep(skb->dev))
 		return 0;
 
-	if (!reg_c0)
+	priv = netdev_priv(skb->dev);
+	esw = priv->mdev->priv.eswitch;
+	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+	uplink_priv = &uplink_rpriv->uplink_priv;
+
+	if (!reg_c0) {
+		if (WARN_ON_ONCE(reg_c1))
+			printk(KERN_ERR "%s %d %s @@ reg_c1 should be zero, but it's %d\n", __FILE__, __LINE__, __func__, reg_c1);
 		return 0;
+	}
 
 	chain = mlx5_eswitch_get_chain_for_tag(esw, reg_c0);
 	if (WARN_ON_ONCE(chain == 0))
@@ -3682,6 +3986,9 @@ int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1)
 	}
 
 	chainp->chain = chain;
+
+	tunnel_id = reg_c1;
+	mlx5e_restore_tunnel(uplink_priv, skb, tunnel_id);
 
 	return 0;
 }
