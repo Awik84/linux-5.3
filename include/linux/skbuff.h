@@ -278,6 +278,12 @@ struct nf_bridge_info {
 };
 #endif
 
+#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+struct tc_skb_ext {
+	__u32 chain;
+};
+#endif
+
 struct sk_buff_head {
 	/* These two members must be first. */
 	struct sk_buff	*next;
@@ -4018,6 +4024,9 @@ enum skb_ext_id {
 #endif
 #ifdef CONFIG_XFRM
 	SKB_EXT_SEC_PATH,
+#endif
+#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+	TC_SKB_EXT,
 #endif
 	SKB_EXT_NUM, /* must be last */
 };
