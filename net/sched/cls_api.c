@@ -21,6 +21,7 @@
 #include <linux/slab.h>
 #include <linux/idr.h>
 #include <linux/rhashtable.h>
+#include <linux/rculist.h>
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <net/netlink.h>
@@ -303,7 +304,7 @@ static struct tcf_chain *tcf_chain_create(struct tcf_block *block,
 	chain = kzalloc(sizeof(*chain), GFP_KERNEL);
 	if (!chain)
 		return NULL;
-	list_add_tail(&chain->list, &block->chain_list);
+	list_add_tail_rcu(&chain->list, &block->chain_list);
 	mutex_init(&chain->filter_chain_lock);
 	chain->block = block;
 	chain->index = chain_index;
@@ -343,7 +344,7 @@ static bool tcf_chain_detach(struct tcf_chain *chain)
 
 	ASSERT_BLOCK_LOCKED(block);
 
-	list_del(&chain->list);
+	list_del_rcu(&chain->list);
 	if (!chain->index)
 		block->chain0.chain = NULL;
 
@@ -395,6 +396,18 @@ static struct tcf_chain *tcf_chain_lookup(struct tcf_block *block,
 	ASSERT_BLOCK_LOCKED(block);
 
 	list_for_each_entry(chain, &block->chain_list, list) {
+		if (chain->index == chain_index)
+			return chain;
+	}
+	return NULL;
+}
+
+static struct tcf_chain *tcf_chain_lookup_rcu(struct tcf_block *block,
+					      u32 chain_index)
+{
+	struct tcf_chain *chain;
+
+	list_for_each_entry_rcu(chain, &block->chain_list, list) {
 		if (chain->index == chain_index)
 			return chain;
 	}
@@ -564,6 +577,29 @@ static struct tcf_block *tc_dev_ingress_block(struct net_device *dev)
 		return NULL;
 
 	return cops->tcf_block(qdisc, TC_H_MIN_INGRESS, NULL);
+}
+
+static struct tcf_block *tc_dev_ingress_block_rcu(struct net_device *dev)
+{
+	struct netdev_queue *nq = dev_ingress_queue_rcu(dev);
+	const struct Qdisc_class_ops *cops;
+	struct Qdisc *qdisc;
+
+	if (!nq)
+		return NULL;
+
+	qdisc = rcu_dereference(nq->qdisc);
+	if (!qdisc)
+		return NULL;
+
+	cops = qdisc->ops->cl_ops;
+	if (!cops)
+		return NULL;
+
+	if (!cops->tcf_block_rcu)
+		return NULL;
+
+	return cops->tcf_block_rcu(qdisc, TC_H_MIN_INGRESS, NULL);
 }
 
 static struct rhashtable indr_setup_block_ht;
@@ -1641,6 +1677,27 @@ int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
 	const struct tcf_proto *orig_tp = tp;
 	const struct tcf_proto *first_tp;
 	int limit = 0;
+
+#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+	{
+		struct tc_skb_ext *ext = skb_ext_find(skb, TC_SKB_EXT);
+
+		if (ext && ext->chain) {
+			struct tcf_chain *fchain;
+			struct tcf_block *block;
+
+			block = tc_dev_ingress_block_rcu(skb->dev);
+			if (!block)
+				goto reclassify;
+
+			fchain = tcf_chain_lookup_rcu(block, ext->chain);
+			if (!fchain)
+				goto reclassify;
+
+			tp = rcu_dereference_bh(fchain->filter_chain);
+		}
+	}
+#endif
 
 reclassify:
 #endif

@@ -15,7 +15,7 @@
 #include <net/pkt_cls.h>
 
 struct ingress_sched_data {
-	struct tcf_block *block;
+	struct tcf_block __rcu *block;
 	struct tcf_block_ext_info block_info;
 	struct mini_Qdisc_pair miniqp;
 };
@@ -49,7 +49,19 @@ static struct tcf_block *ingress_tcf_block(struct Qdisc *sch, unsigned long cl,
 {
 	struct ingress_sched_data *q = qdisc_priv(sch);
 
-	return q->block;
+	/* Ingress is an unlocked Qdisc, which means this function can be called
+	 * without rtnl protection if caller holds a reference to it.
+	 */
+	return rcu_dereference_raw(q->block);
+}
+
+static struct tcf_block *ingress_tcf_block_rcu(struct Qdisc *sch,
+					       unsigned long cl,
+					       struct netlink_ext_ack *extack)
+{
+	struct ingress_sched_data *q = qdisc_priv(sch);
+
+	return rcu_dereference(q->block);
 }
 
 static void clsact_chain_head_change(struct tcf_proto *tp_head, void *priv)
@@ -119,6 +131,7 @@ static const struct Qdisc_class_ops ingress_class_ops = {
 	.find		=	ingress_find,
 	.walk		=	ingress_walk,
 	.tcf_block	=	ingress_tcf_block,
+	.tcf_block_rcu	=	ingress_tcf_block_rcu,
 	.bind_tcf	=	ingress_bind_filter,
 	.unbind_tcf	=	ingress_unbind_filter,
 };
@@ -137,8 +150,8 @@ static struct Qdisc_ops ingress_qdisc_ops __read_mostly = {
 };
 
 struct clsact_sched_data {
-	struct tcf_block *ingress_block;
-	struct tcf_block *egress_block;
+	struct tcf_block __rcu *ingress_block;
+	struct tcf_block __rcu *egress_block;
 	struct tcf_block_ext_info ingress_block_info;
 	struct tcf_block_ext_info egress_block_info;
 	struct mini_Qdisc_pair miniqp_ingress;
@@ -167,11 +180,30 @@ static struct tcf_block *clsact_tcf_block(struct Qdisc *sch, unsigned long cl,
 {
 	struct clsact_sched_data *q = qdisc_priv(sch);
 
+	/* Clsact is an unlocked Qdisc, which means this function can be called
+	 * without rtnl protection if caller holds a reference to it.
+	 */
 	switch (cl) {
 	case TC_H_MIN(TC_H_MIN_INGRESS):
-		return q->ingress_block;
+		return rcu_dereference_raw(q->ingress_block);
 	case TC_H_MIN(TC_H_MIN_EGRESS):
-		return q->egress_block;
+		return rcu_dereference_raw(q->egress_block);
+	default:
+		return NULL;
+	}
+}
+
+static struct tcf_block *clsact_tcf_block_rcu(struct Qdisc *sch,
+					      unsigned long cl,
+					      struct netlink_ext_ack *extack)
+{
+	struct clsact_sched_data *q = qdisc_priv(sch);
+
+	switch (cl) {
+	case TC_H_MIN(TC_H_MIN_INGRESS):
+		return rcu_dereference(q->ingress_block);
+	case TC_H_MIN(TC_H_MIN_EGRESS):
+		return rcu_dereference(q->egress_block);
 	default:
 		return NULL;
 	}
@@ -252,6 +284,7 @@ static const struct Qdisc_class_ops clsact_class_ops = {
 	.find		=	clsact_find,
 	.walk		=	ingress_walk,
 	.tcf_block	=	clsact_tcf_block,
+	.tcf_block_rcu	=	clsact_tcf_block_rcu,
 	.bind_tcf	=	clsact_bind_filter,
 	.unbind_tcf	=	ingress_unbind_filter,
 };

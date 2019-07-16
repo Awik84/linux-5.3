@@ -214,6 +214,9 @@ struct Qdisc_class_ops {
 	struct tcf_block *	(*tcf_block)(struct Qdisc *sch,
 					     unsigned long arg,
 					     struct netlink_ext_ack *extack);
+	struct tcf_block *	(*tcf_block_rcu)(struct Qdisc *sch,
+						 unsigned long arg,
+						 struct netlink_ext_ack *eack);
 	unsigned long		(*bind_tcf)(struct Qdisc *, unsigned long,
 					u32 classid);
 	void			(*unbind_tcf)(struct Qdisc *, unsigned long);
