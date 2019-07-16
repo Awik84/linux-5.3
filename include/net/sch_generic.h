@@ -278,7 +278,10 @@ struct tcf_result {
 			unsigned long	class;
 			u32		classid;
 		};
-		const struct tcf_proto *goto_tp;
+		struct {
+			const struct tcf_proto *goto_tp;
+			u32 goto_index;
+		};
 
 		/* used in the skb_tc_reinsert function */
 		struct {

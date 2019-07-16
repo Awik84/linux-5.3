@@ -27,6 +27,7 @@ static void tcf_action_goto_chain_exec(const struct tc_action *a,
 {
 	const struct tcf_chain *chain = rcu_dereference_bh(a->goto_chain);
 
+	res->goto_index = chain->index;
 	res->goto_tp = rcu_dereference_bh(chain->filter_chain);
 }
 
