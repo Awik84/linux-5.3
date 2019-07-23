@@ -48,10 +48,54 @@
  */
 #define MLX5_ESW_MISS_FLOWS (2)
 
-#define fdb_prio_table(esw, chain, prio, level) \
-	(esw)->fdb_table.offloads.fdb_prio[(chain)][(prio)][(level)]
+#define fdb_chains_ht(esw) (esw)->fdb_table.offloads.fdb_chains_ht
+#define fdb_prios_ht(esw) (esw)->fdb_table.offloads.fdb_prios_ht
+#define FDB_IGNORE_FLOW_LEVEL(esw) true
+				   //MLX5_CAP_ESW_FLOWTABLE_FDB((esw)->dev, ignore_flow_level)
 
 #define UPLINK_REP_INDEX 0
+
+struct fdb_chain {
+	struct rhash_head node;
+
+	u32 chain;
+
+	int ref;
+
+	struct list_head prios_list;
+};
+
+struct fdb_prio {
+	struct rhash_head node;
+	struct list_head list;
+
+	/* key in fdb_prios_ht, See prio_params below. */
+	u32 chain;
+	u32 prio;
+	u32 level;
+
+	int ref;
+
+	struct fdb_chain *fdb_chain;
+	struct mlx5_flow_table *fdb;
+	struct mlx5_flow_group *miss_group;
+	struct mlx5_flow_handle *miss_rule;
+};
+
+static const struct rhashtable_params chain_params = {
+	.head_offset = offsetof(struct fdb_chain, node),
+	.key_offset = offsetof(struct fdb_chain, chain),
+	.key_len = sizeof(int),
+	.automatic_shrinking = true,
+};
+
+static const struct rhashtable_params prio_params = {
+	.head_offset = offsetof(struct fdb_prio, node),
+	.key_offset = offsetof(struct fdb_prio, chain),
+	.key_len = sizeof(u32) * 3,
+	.automatic_shrinking = true,
+};
+
 
 static struct mlx5_eswitch_rep *mlx5_eswitch_get_rep(struct mlx5_eswitch *esw,
 						     u16 vport_num)
@@ -63,9 +107,9 @@ static struct mlx5_eswitch_rep *mlx5_eswitch_get_rep(struct mlx5_eswitch *esw,
 }
 
 static struct mlx5_flow_table *
-esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u16 prio, int level);
+esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level);
 static void
-esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u16 prio, int level);
+esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level);
 
 bool mlx5_eswitch_prios_supported(struct mlx5_eswitch *esw)
 {
@@ -74,18 +118,35 @@ bool mlx5_eswitch_prios_supported(struct mlx5_eswitch *esw)
 
 u32 mlx5_eswitch_get_chain_range(struct mlx5_eswitch *esw)
 {
-	if (esw->fdb_table.flags & ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED)
-		return FDB_MAX_CHAIN;
+	if (!mlx5_eswitch_prios_supported(esw))
+		return 1;
 
-	return 0;
+	if (FDB_IGNORE_FLOW_LEVEL(esw))
+		return UINT_MAX;
+
+	return FDB_MAX_CHAIN;
 }
 
-u16 mlx5_eswitch_get_prio_range(struct mlx5_eswitch *esw)
+unsigned int mlx5_eswitch_get_prio_range(struct mlx5_eswitch *esw)
 {
-	if (esw->fdb_table.flags & ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED)
-		return FDB_MAX_PRIO;
+	if (!mlx5_eswitch_prios_supported(esw))
+		return 1;
 
-	return 1;
+	if (FDB_IGNORE_FLOW_LEVEL(esw))
+		return UINT_MAX;
+
+	return FDB_MAX_PRIO;
+}
+
+unsigned int mlx5_eswitch_get_level_range(struct mlx5_eswitch *esw)
+{
+	if (!mlx5_eswitch_prios_supported(esw))
+		return 1;
+
+	if (FDB_IGNORE_FLOW_LEVEL(esw))
+		return UINT_MAX;
+
+	return FDB_MAX_LEVEL;
 }
 
 static void
@@ -167,9 +228,15 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 	}
 
 	if (flow_act.action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) {
-		if (attr->dest_chain) {
-			struct mlx5_flow_table *ft;
+		struct mlx5_flow_table *ft;
 
+		if (attr->slow_path) {
+			flow_act.ignore_level = true;
+			dest[i].type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+			dest[i].ft = esw->fdb_table.offloads.slow_fdb;
+			i++;
+		} else if (attr->dest_chain) {
+			flow_act.ignore_level = true;
 			ft = esw_get_prio_table(esw, attr->dest_chain, 1, 0);
 			if (IS_ERR(ft)) {
 				rule = ERR_CAST(ft);
@@ -216,6 +283,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 		flow_act.modify_id = attr->mod_hdr_id;
 
 	fdb = esw_get_prio_table(esw, attr->chain, attr->prio, !!split);
+	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d (split: %d), got fdb: %px\n", __FILE__, __LINE__, __func__, attr->chain, attr->prio, split, fdb);
 	if (IS_ERR(fdb)) {
 		rule = ERR_CAST(fdb);
 		goto err_esw_get;
@@ -908,128 +976,516 @@ put_sz_to_pool(struct mlx5_eswitch *esw, int sz)
 
 static struct mlx5_flow_table *
 create_next_size_table(struct mlx5_eswitch *esw,
-		       struct mlx5_flow_namespace *ns,
-		       u16 table_prio,
-		       int level,
-		       u32 flags)
+		       u32 chain,
+		       u32 prio,
+		       u32 level,
+		       struct mlx5_flow_table *next_ft)
 {
-	struct mlx5_flow_table *fdb;
-	int sz;
-
-	sz = get_sz_from_pool(esw);
-	if (!sz)
-		return ERR_PTR(-ENOSPC);
-
-	fdb = mlx5_create_auto_grouped_flow_table(ns,
-						  table_prio,
-						  sz,
-						  ESW_OFFLOADS_NUM_GROUPS,
-						  level,
-						  flags);
-	if (IS_ERR(fdb)) {
-		esw_warn(esw->dev, "Failed to create FDB Table err %d (table prio: %d, level: %d, size: %d)\n",
-			 (int)PTR_ERR(fdb), table_prio, level, sz);
-		put_sz_to_pool(esw, sz);
-	}
-
-	return fdb;
-}
-
-static struct mlx5_flow_table *
-esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u16 prio, int level)
-{
-	struct mlx5_core_dev *dev = esw->dev;
-	struct mlx5_flow_table *fdb = NULL;
+	struct mlx5_flow_table_attr ft_attr = {};
 	struct mlx5_flow_namespace *ns;
-	int table_prio, l = 0;
+	struct mlx5_flow_table *fdb;
 	u32 flags = 0;
-
-	if (chain == FDB_SLOW_PATH_CHAIN)
-		return esw->fdb_table.offloads.slow_fdb;
-
-	mutex_lock(&esw->fdb_table.offloads.fdb_prio_lock);
-
-	fdb = fdb_prio_table(esw, chain, prio, level).fdb;
-	if (fdb) {
-		/* take ref on earlier levels as well */
-		while (level >= 0)
-			fdb_prio_table(esw, chain, prio, level--).num_rules++;
-		mutex_unlock(&esw->fdb_table.offloads.fdb_prio_lock);
-		return fdb;
-	}
-
-	ns = mlx5_get_fdb_sub_ns(dev, chain);
-	if (!ns) {
-		esw_warn(dev, "Failed to get FDB sub namespace\n");
-		mutex_unlock(&esw->fdb_table.offloads.fdb_prio_lock);
-		return ERR_PTR(-EOPNOTSUPP);
-	}
+	int sz;
 
 	if (esw->offloads.encap != DEVLINK_ESWITCH_ENCAP_MODE_NONE)
 		flags |= (MLX5_FLOW_TABLE_TUNNEL_EN_REFORMAT |
 			  MLX5_FLOW_TABLE_TUNNEL_EN_DECAP);
 
-	table_prio = (chain * FDB_MAX_PRIO) + prio - 1;
+	sz = get_sz_from_pool(esw);
+	if (!sz)
+		return ERR_PTR(-ENOSPC);
 
-	/* create earlier levels for correct fs_core lookup when
-	 * connecting tables
-	 */
-	for (l = 0; l <= level; l++) {
-		if (fdb_prio_table(esw, chain, prio, l).fdb) {
-			fdb_prio_table(esw, chain, prio, l).num_rules++;
-			continue;
-		}
+	ft_attr.max_fte = sz;
+	ft_attr.flags   = flags;
+	ft_attr.next_ft   = next_ft;
 
-		fdb = create_next_size_table(esw, ns, table_prio, l, flags);
-		if (IS_ERR(fdb)) {
-			l--;
-			goto err_create_fdb;
-		}
-
-		fdb_prio_table(esw, chain, prio, l).fdb = fdb;
-		fdb_prio_table(esw, chain, prio, l).num_rules = 1;
+	if (!FDB_IGNORE_FLOW_LEVEL(esw) ||
+	    (chain == 0 && prio == 1 && level == 0)) {
+		/* Chain 0 prio 1 level 0, our root, is always created,
+		 * is to be managed. This will connect it to our previous
+		 * prio (FDB_BYPASS_PATH if exists), and update the
+		 * correct FDB namespace root. The next_ft will be slow path,
+		 * but we use an explicit miss rule to change this to
+		 * our unmanaged next prio.
+		 * Also, if we don't support ignore_flow_level, fall back
+		 * to old static structure */
+		ft_attr.unmanaged = false;
+		ft_attr.level = level;
+		ft_attr.prio = (chain * FDB_MAX_PRIO) + prio - 1;
+		ns = mlx5_get_fdb_sub_ns(esw->dev, chain);
+	} else {
+		ft_attr.unmanaged = true;
+		ft_attr.prio = FDB_FAST_PATH;
+		ft_attr.level = 1;
+		ns = mlx5_get_flow_namespace(esw->dev, MLX5_FLOW_NAMESPACE_FDB);
 	}
 
-	mutex_unlock(&esw->fdb_table.offloads.fdb_prio_lock);
-	return fdb;
+	printk(KERN_ERR "%s %d %s @@ creating fdb, chain: %d, prio: %d, level: %d, sz: %d, managed: %d\n", __FILE__, __LINE__, __func__, chain, prio, level, sz, !ft_attr.unmanaged);
+	fdb = mlx5_create_flow_table(ns, &ft_attr);
+	if (IS_ERR(fdb)) {
+		esw_warn(esw->dev, "Failed to create FDB Table err %d (chain %d, prio: %d, level: %d, actual level: %d, size: %d)\n",
+			 (int)PTR_ERR(fdb), chain, prio, level, fdb->level, sz);
+		put_sz_to_pool(esw, sz);
+	}
 
-err_create_fdb:
-	mutex_unlock(&esw->fdb_table.offloads.fdb_prio_lock);
-	if (l >= 0)
-		esw_put_prio_table(esw, chain, prio, l);
+	fdb->autogroup.active = true;
+	fdb->autogroup.required_groups = 5;
+
+	printk(KERN_ERR "%s %d %s @@ created fdb: %px, chain: %d, prio: %d, level: %d, actual level: %d, sz: %d\n", __FILE__, __LINE__, __func__, fdb, chain, prio, level, fdb->level, sz);
 
 	return fdb;
+}
+
+static struct fdb_chain *create_fdb_chain(struct mlx5_eswitch *esw, u32 chain)
+ {
+	struct fdb_chain *fdb_chain = NULL;
+	int err;
+
+	fdb_chain = kvzalloc(sizeof(*fdb_chain), GFP_KERNEL);
+	if (!fdb_chain) {
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, -ENOMEM);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	fdb_chain->chain = chain;
+	INIT_LIST_HEAD(&fdb_chain->prios_list);
+
+	err = rhashtable_insert_fast(&fdb_chains_ht(esw), &fdb_chain->node,
+				     chain_params);
+	if (err) {
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+		goto err_insert;
+	}
+
+	printk(KERN_ERR "%s %d %s @@ created new chain: %d\n", __FILE__, __LINE__, __func__, chain);
+	return fdb_chain;
+
+err_insert:
+	kvfree(fdb_chain);
+	return ERR_PTR(err);
+}
+
+static void destory_fdb_chain(struct mlx5_eswitch *esw, struct fdb_chain *fdb_chain)
+{
+	printk(KERN_ERR "%s %d %s @@ destory chain: %d\n", __FILE__, __LINE__, __func__, fdb_chain->chain);
+	rhashtable_remove_fast(&fdb_chains_ht(esw), &fdb_chain->node,
+			       chain_params);
+	kvfree(fdb_chain);
+}
+
+static struct fdb_chain *get_fdb_chain(struct mlx5_eswitch *esw, u32 chain)
+{
+	struct fdb_chain *fdb_chain;
+
+	fdb_chain = rhashtable_lookup_fast(&fdb_chains_ht(esw), &chain,
+					   chain_params);
+	if (!fdb_chain) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, creating...\n", __FILE__, __LINE__, __func__, chain);
+		fdb_chain = create_fdb_chain(esw, chain);
+		if (IS_ERR(fdb_chain))
+			return fdb_chain;
+	}
+
+	fdb_chain->ref++;
+	printk(KERN_ERR "%s %d %s @@ chain: %d, after ref: %d\n", __FILE__, __LINE__, __func__, chain, fdb_chain->ref);
+
+	return fdb_chain;
+}
+
+static void put_fdb_chain(struct mlx5_eswitch *esw,
+			  struct fdb_chain *fdb_chain)
+{
+	printk(KERN_ERR "%s %d %s @@ chain: %d, ref before dec: %d\n", __FILE__, __LINE__, __func__, fdb_chain->chain, fdb_chain->ref);
+	if (--fdb_chain->ref == 0) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, destroy\n", __FILE__, __LINE__, __func__, fdb_chain->chain);
+		destory_fdb_chain(esw, fdb_chain);
+	}
+}
+
+#define prio_fmt "%px (chain: %d, prio: %d, level: %d)"
+#define prio_fmt_s "(%d, %d, %d)"
+#define prio_print(fdb_prio) (fdb_prio), (fdb_prio)->chain, (fdb_prio)->prio, (fdb_prio)->level
+#define prio_print_s(fdb_prio) (fdb_prio)->chain, (fdb_prio)->prio, (fdb_prio)->level
+#define prio_from_list(l) list_entry(l, struct fdb_prio, list)
+#define prio_list_params(l) (prio_from_list(l)), (prio_from_list(l))->chain, (prio_from_list(l))->prio, (prio_from_list(l))->level
+static struct fdb_prio *create_fdb_prio(struct mlx5_eswitch *esw,
+					u32 chain, u32 prio, u32 level)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	struct mlx5_flow_destination dest = {};
+	struct mlx5_flow_handle *miss_rule = NULL;
+	struct fdb_prio *fdb_prio = NULL;
+	struct mlx5_flow_spec spec = {};
+	struct mlx5_flow_table *next_ft;
+	struct mlx5_flow_act act = {0};
+	struct fdb_chain *fdb_chain;
+	struct list_head *pos;
+	u32 *flow_group_in;
+	int err;
+
+	fdb_chain = get_fdb_chain(esw, chain);
+	if (IS_ERR(fdb_chain))
+		return ERR_CAST(fdb_chain);
+
+	fdb_prio = kvzalloc(sizeof(*fdb_prio), GFP_KERNEL);
+	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+	if (!fdb_prio || !flow_group_in) {
+		err = -ENOMEM;
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+		goto err_alloc;
+	}
+
+	fdb_prio->chain = chain;
+	fdb_prio->prio = prio;
+	fdb_prio->level = level;
+	fdb_prio->fdb_chain = fdb_chain;
+
+	/* prio list is sorted by prio and level, and for each
+	 * prio we expect to have level 0 (expected to be handled by user of
+	 * this API), example list: (3,0)->(3,2)->(5,0)->(5,3)->(7,0)
+	 * All levels point to next prio level 0.
+	 * In hardware, we will we have the following pointers:
+	 * (3,0) -> (5,0) -> (7,0)
+	 * (3,2) -> (5,0)
+	 * (5,3) -> (7,0)
+	 * */
+	list_for_each(pos, &fdb_chain->prios_list) {
+		struct fdb_prio *p = list_entry(pos, struct fdb_prio, list);
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt_s" < "prio_fmt_s"?\n", __FILE__, __LINE__, __func__, prio_print_s(fdb_prio), prio_print_s(p));
+		if (prio < p->prio || (prio == p->prio && level < p->level)) /* exit on first that is largest */
+		{
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" break\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+			break;
+		}
+	}
+
+	if (pos != &fdb_chain->prios_list) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" next "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), prio_list_params(pos));
+		next_ft = list_entry(pos, struct fdb_prio, list)->fdb;
+	} else {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" next is slow \n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+		next_ft = esw->fdb_table.offloads.slow_fdb;
+	}
+
+	fdb_prio->fdb = create_next_size_table(esw, fdb_chain->chain,
+					       prio, level, esw->fdb_table.offloads.slow_fdb);
+	if (IS_ERR(fdb_prio->fdb)) {
+		err = PTR_ERR(fdb_prio->fdb);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(fdb_prio), err);
+		goto err_create;
+	}
+
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" fdb: %px, fdb_prio->fdb autogroups: %d, creating group\n", __FILE__, __LINE__, __func__,
+				     prio_print(fdb_prio), fdb_prio->fdb, fdb_prio->fdb->autogroup.active);
+	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, fdb_prio->fdb->max_fte-3);
+	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, fdb_prio->fdb->max_fte-1);
+	fdb_prio->miss_group = mlx5_create_flow_group(fdb_prio->fdb,
+						      flow_group_in);
+	fdb_prio->fdb->autogroup.num_groups++;
+	if (IS_ERR(fdb_prio->miss_group)) {
+		err = PTR_ERR(fdb_prio->miss_group);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(fdb_prio), err);
+		goto err_group;
+	}
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" fg: %px (id: %d)\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio),  fdb_prio->miss_group, fdb_prio->miss_group->id);
+
+	/* We handle miss rules just for level 0 tables and we expect
+	 * level 0 to be added first for each prio, other levels are
+	 * ignored. */
+	if (!level && pos == &fdb_chain->prios_list) { /* if we are last */
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" creating miss rule to slow fdb, using miss hdr: %d\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+		memset(&act, 0, sizeof(act));
+		act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+		act.ignore_level = true;
+		act.flags = FLOW_ACT_NO_APPEND;
+		dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+		dest.ft = esw->fdb_table.offloads.slow_fdb;
+		miss_rule = mlx5_add_flow_rules(fdb_prio->fdb, &spec, &act,
+						&dest, 1);
+		if (IS_ERR(miss_rule)) {
+			err = PTR_ERR(miss_rule);
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(fdb_prio), err);
+			goto err_miss_rule;
+		}
+
+		fdb_prio->miss_rule = miss_rule;
+	} else if (!level) {
+		memset(&act, 0, sizeof(act));
+		act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+		act.ignore_level = true;
+		act.flags = FLOW_ACT_NO_APPEND;
+		dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+		dest.ft = next_ft;
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" creating miss rule to next ft %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), next_ft);
+		miss_rule = mlx5_add_flow_rules(fdb_prio->fdb, &spec, &act,
+						&dest, 1);
+		if (IS_ERR(miss_rule)) {
+			err = PTR_ERR(miss_rule);
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(fdb_prio), err);
+			goto err_miss_rule;
+		}
+
+		fdb_prio->miss_rule = miss_rule;
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss_rule: %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->miss_rule);
+	}
+
+	if (!level && pos->prev != &fdb_chain->prios_list) {
+		/* update prev */
+		struct fdb_prio *pos_prio = list_entry(pos,
+						       struct fdb_prio,
+						       list);
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" update prevs\n",  __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+		list_for_each_entry_continue_reverse(pos_prio,
+						     &fdb_chain->prios_list,
+						     list) {
+			if (pos_prio->level)
+				continue;
+
+			printk(KERN_ERR "%s %d %s @@ updating "prio_fmt" to point to "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), prio_print(fdb_prio));
+
+			memset(&act, 0, sizeof(act));
+			act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+			act.ignore_level = true;
+			act.flags = FLOW_ACT_NO_APPEND;
+			dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+			dest.ft = fdb_prio->fdb;
+			miss_rule = mlx5_add_flow_rules(pos_prio->fdb, &spec, &act,
+							&dest, 1);
+			if (IS_ERR(miss_rule)) {
+				err = PTR_ERR(miss_rule);
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" error adding miss rule: %d\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), err);
+				miss_rule = NULL;
+				goto err_prev_rule;
+			}
+
+			if (pos_prio->miss_rule) {
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule %px\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), pos_prio->miss_rule);
+				mlx5_del_flow_rules(pos_prio->miss_rule);
+			} else {
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rulle?\n", __FILE__, __LINE__, __func__, prio_print(pos_prio));
+			}
+
+			pos_prio->miss_rule = miss_rule;
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss_rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), pos_prio->miss_rule);
+			break;
+
+			/*
+			WARN_ON(mlx5_set_flow_table_next(pos_prio->fdb,
+							 fdb_prio->fdb));
+			*/
+		}
+	}
+
+	list_add(&fdb_prio->list, pos->prev);
+
+	{
+		char list[256] = "";
+		struct fdb_prio *t;
+
+		list_for_each_entry(t, &fdb_chain->prios_list, list) {
+			sprintf(list, "%s "prio_fmt_s"", list, prio_print_s(t));
+		}
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" list: %s\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), list);
+	}
+
+	err = rhashtable_insert_fast(&fdb_prios_ht(esw), &fdb_prio->node,
+				     prio_params);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" add to prios_ht: %d\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), err);
+
+	kvfree(flow_group_in);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" created\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+	return fdb_prio;
+
+err_prev_rule:
+	if (miss_rule)
+		mlx5_del_flow_rules(miss_rule);
+err_miss_rule:
+	mlx5_destroy_flow_group(fdb_prio->miss_group);
+err_group:
+	mlx5_destroy_flow_table(fdb_prio->fdb);
+err_create:
+err_alloc:
+	printk(KERN_ERR "%s %d %s @@ %d\n", __FILE__, __LINE__, __func__, err);
+	kvfree(fdb_prio);
+	kvfree(flow_group_in);
+	put_fdb_chain(esw, fdb_chain);
+	return ERR_PTR(err);
+}
+
+static void destory_fdb_prio(struct mlx5_eswitch *esw, struct fdb_prio *fdb_prio)
+{
+	struct fdb_chain *fdb_chain = fdb_prio->fdb_chain;
+	struct list_head *next = fdb_prio->list.next;
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+
+	if (!fdb_prio->level) {
+		struct mlx5_flow_destination dest = {};
+		struct mlx5_flow_handle *miss_rule;
+		struct mlx5_flow_spec spec = {};
+		struct mlx5_flow_act act = {0};
+		struct fdb_prio *pos = fdb_prio;
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" - update prevs\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+		if (next == &fdb_chain->prios_list) {
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" was max updating chain miss rule\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+			list_for_each_entry_continue_reverse(pos,
+							     &fdb_chain->prios_list,
+							     list) {
+				if (pos->level)
+					continue;
+
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" moving it to point to slow path\n", __FILE__, __LINE__, __func__, prio_print(pos));
+				memset(&act, 0, sizeof(act));
+				act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+				act.ignore_level = true;
+				act.flags = FLOW_ACT_NO_APPEND;
+				dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+				dest.ft = esw->fdb_table.offloads.slow_fdb;
+				miss_rule = mlx5_add_flow_rules(pos->fdb, &spec, &act,
+								&dest, 1);
+				if (WARN_ON(IS_ERR(miss_rule))) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" out of sync: %d\n", __FILE__, __LINE__, __func__, prio_print(pos), (int) PTR_ERR(miss_rule));
+					break;
+				}
+
+				if (pos->miss_rule) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+					mlx5_del_flow_rules(pos->miss_rule);
+				} else {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rule!\n", __FILE__, __LINE__, __func__, prio_print(pos));
+				}
+				pos->miss_rule = miss_rule;
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+				break;
+			}
+		} else {
+			struct fdb_prio *next_prio = list_entry(next, struct fdb_prio, list);
+
+			list_for_each_entry_continue_reverse(pos,
+						             &fdb_chain->prios_list,
+							     list) {
+				if (pos->level)
+					continue;
+
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" updating miss to -> "prio_fmt")\n", __FILE__, __LINE__, __func__, prio_print(pos), prio_print(next_prio));
+
+				memset(&act, 0, sizeof(act));
+				act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+				act.ignore_level = true;
+				act.flags = FLOW_ACT_NO_APPEND;
+				dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+				dest.ft = next_prio->fdb;
+				miss_rule = mlx5_add_flow_rules(pos->fdb, &spec, &act,
+								&dest, 1);
+				if (IS_ERR(miss_rule)) {
+					int err = PTR_ERR(miss_rule);
+
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" error adding miss rule %d\n", __FILE__, __LINE__, __func__, prio_print(pos), err);
+					break;
+				}
+
+				if (pos->miss_rule) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+					mlx5_del_flow_rules(pos->miss_rule);
+				} else {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rule!\n", __FILE__, __LINE__, __func__, prio_print(pos));
+				}
+				pos->miss_rule = miss_rule;
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+				break;
+			}
+		}
+	}
+
+	rhashtable_remove_fast(&fdb_prios_ht(esw), &fdb_prio->node,
+			       prio_params);
+	list_del(&fdb_prio->list);
+
+	if (!fdb_prio->level) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->miss_rule);
+		mlx5_del_flow_rules(fdb_prio->miss_rule);
+	}
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss group: %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->miss_group);
+	mlx5_destroy_flow_group(fdb_prio->miss_group);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting fdb: %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->fdb);
+	mlx5_destroy_flow_table(fdb_prio->fdb);
+
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" put chain\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+	put_fdb_chain(esw, fdb_chain);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" free\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+	kvfree(fdb_prio);
+}
+
+static struct mlx5_flow_table *
+esw_get_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level)
+{
+	struct fdb_prio *fdb_prio;
+	struct {
+		u32 chain;
+		u32 prio;
+		u32 level;
+	} key = { chain, prio, level };
+
+	if (chain > mlx5_eswitch_get_chain_range(esw) ||
+	    prio > mlx5_eswitch_get_prio_range(esw) ||
+	    level > mlx5_eswitch_get_level_range(esw))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d\n", __FILE__, __LINE__, __func__, chain, prio, level);
+
+	mutex_lock(&esw->fdb_table.offloads.fdb_chains_lock);
+	fdb_prio = rhashtable_lookup_fast(&fdb_prios_ht(esw), &key,
+					  prio_params);
+	if (!fdb_prio) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d, creating...\n", __FILE__, __LINE__, __func__, chain, prio, level);
+		fdb_prio = create_fdb_prio(esw, chain, prio, level);
+		if (IS_ERR(fdb_prio))
+			goto err_create_prio;
+	}
+
+	++fdb_prio->ref;
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" before inc %d, fdb: %px\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->ref, fdb_prio->fdb);
+	mutex_unlock(&esw->fdb_table.offloads.fdb_chains_lock);
+
+	return fdb_prio->fdb;
+
+err_create_prio:
+	mutex_unlock(&esw->fdb_table.offloads.fdb_chains_lock);
+	return ERR_CAST(fdb_prio);
 }
 
 static void
-esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u16 prio, int level)
+esw_put_prio_table(struct mlx5_eswitch *esw, u32 chain, u32 prio, u32 level)
 {
-	int l;
+	struct fdb_prio *fdb_prio;
+	struct {
+		u32 chain;
+		u32 prio;
+		u32 level;
+	} key = { chain, prio, level };
 
-	if (chain == FDB_SLOW_PATH_CHAIN)
-		return;
+	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d, destroy...\n", __FILE__, __LINE__, __func__, chain, prio, level);
 
-	mutex_lock(&esw->fdb_table.offloads.fdb_prio_lock);
+	mutex_lock(&esw->fdb_table.offloads.fdb_chains_lock);
+	fdb_prio = rhashtable_lookup_fast(&fdb_prios_ht(esw), &key,
+					  prio_params);
+	if (!fdb_prio)
+		goto err_get_prio;
 
-	for (l = level; l >= 0; l--) {
-		if (--(fdb_prio_table(esw, chain, prio, l).num_rules) > 0)
-			continue;
-
-		put_sz_to_pool(esw, fdb_prio_table(esw, chain, prio, l).fdb->max_fte);
-		mlx5_destroy_flow_table(fdb_prio_table(esw, chain, prio, l).fdb);
-		fdb_prio_table(esw, chain, prio, l).fdb = NULL;
+	printk(KERN_ERR "%s %d %s @ "prio_fmt" ref before dec: %d\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio), fdb_prio->ref);
+	if (--fdb_prio->ref == 0) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" destroy...\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
+		destory_fdb_prio(esw, fdb_prio);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" destroy... done\n", __FILE__, __LINE__, __func__, prio_print(fdb_prio));
 	}
+	mutex_unlock(&esw->fdb_table.offloads.fdb_chains_lock);
+	return;
 
-	mutex_unlock(&esw->fdb_table.offloads.fdb_prio_lock);
-}
-
-static void esw_destroy_offloads_fast_fdb_tables(struct mlx5_eswitch *esw)
-{
-	/* If lazy creation isn't supported, deref the fast path tables */
-	if (!(esw->fdb_table.flags & ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED)) {
-		esw_put_prio_table(esw, 0, 1, 1);
-		esw_put_prio_table(esw, 0, 1, 0);
-	}
+err_get_prio:
+	mutex_unlock(&esw->fdb_table.offloads.fdb_chains_lock);
+	WARN_ON(1);
 }
 
 #define MAX_PF_SQ 256
@@ -1074,9 +1530,20 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
 	u8 *dmac;
 
 	esw_debug(esw->dev, "Create offloads FDB Tables\n");
+
+	mutex_init(&esw->fdb_table.offloads.fdb_chains_lock);
+
+	err = rhashtable_init(&fdb_chains_ht(esw), &chain_params);
+	if (err)
+		return err;
+
+	err = rhashtable_init(&fdb_prios_ht(esw), &prio_params);
+	if (err)
+		goto init_err;
+
 	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
 	if (!flow_group_in)
-		return -ENOMEM;
+		goto alloc_err;
 
 	root_ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_FDB);
 	if (!root_ns) {
@@ -1120,16 +1587,38 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
 	}
 	esw->fdb_table.offloads.slow_fdb = fdb;
 
-	/* If lazy creation isn't supported, open the fast path tables now */
-	if (!MLX5_CAP_ESW_FLOWTABLE(esw->dev, multi_fdb_encap) &&
-	    esw->offloads.encap != DEVLINK_ESWITCH_ENCAP_MODE_NONE) {
-		esw->fdb_table.flags &= ~ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED;
-		esw_warn(dev, "Lazy creation of flow tables isn't supported, ignoring priorities\n");
-		esw_get_prio_table(esw, 0, 1, 0);
-		esw_get_prio_table(esw, 0, 1, 1);
-	} else {
-		esw_debug(dev, "Lazy creation of flow tables supported, deferring table opening\n");
+	/* If lazy creation isn't supported, we can't support new tables if
+	 * if we have encap enabled */
+	if (MLX5_CAP_ESW_FLOWTABLE(esw->dev, multi_fdb_encap) ||
+	    esw->offloads.encap == DEVLINK_ESWITCH_ENCAP_MODE_NONE) {
 		esw->fdb_table.flags |= ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED;
+		esw_info(dev, "Lazy creation of flow tables supported, deferring table opening\n");
+		esw_info(dev, "Supported fdb range - chains: %u, prios: %u (Ignore flow level support: %d)\n",
+			 mlx5_eswitch_get_chain_range(esw),
+			 mlx5_eswitch_get_prio_range(esw),
+			 !!(FDB_IGNORE_FLOW_LEVEL(esw)));
+	} else {
+		esw->fdb_table.flags &= ~ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED;
+	}
+
+	/* always open the root for fast path */
+	{
+		struct mlx5_flow_table *ft = esw_get_prio_table(esw, 0, 1, 0);
+
+		if (IS_ERR(ft)) {
+			err = PTR_ERR(ft);
+			goto fast_fdb_err;
+		}
+	}
+
+	/* Open level 1 for split rules now if chains not supported */
+	if (!mlx5_eswitch_prios_supported(esw)) {
+		struct mlx5_flow_table *ft = esw_get_prio_table(esw, 0, 1, 1);
+
+		if (IS_ERR(ft)) {
+			err = PTR_ERR(ft);
+			goto level_fdb_err;
+		}
 	}
 
 	/* create send-to-vport group */
@@ -1220,11 +1709,20 @@ miss_err:
 peer_miss_err:
 	mlx5_destroy_flow_group(esw->fdb_table.offloads.send_to_vport_grp);
 send_vport_err:
-	esw_destroy_offloads_fast_fdb_tables(esw);
+	if (!mlx5_eswitch_prios_supported(esw))
+		esw_put_prio_table(esw, 0, 1, 1);
+level_fdb_err:
+	esw_put_prio_table(esw, 0, 1, 0);
+fast_fdb_err:
 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
 slow_fdb_err:
 ns_err:
 	kvfree(flow_group_in);
+alloc_err:
+	rhashtable_destroy(&fdb_prios_ht(esw));
+init_err:
+	rhashtable_destroy(&fdb_chains_ht(esw));
+	mutex_destroy(&esw->fdb_table.offloads.fdb_chains_lock);
 	return err;
 }
 
@@ -1240,8 +1738,14 @@ static void esw_destroy_offloads_fdb_tables(struct mlx5_eswitch *esw)
 	mlx5_destroy_flow_group(esw->fdb_table.offloads.peer_miss_grp);
 	mlx5_destroy_flow_group(esw->fdb_table.offloads.miss_grp);
 
+	if (!mlx5_eswitch_prios_supported(esw))
+		esw_put_prio_table(esw, 0, 1, 1);
+	esw_put_prio_table(esw, 0, 1, 0);
 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
-	esw_destroy_offloads_fast_fdb_tables(esw);
+
+	rhashtable_destroy(&fdb_prios_ht(esw));
+	rhashtable_destroy(&fdb_chains_ht(esw));
+	mutex_destroy(&esw->fdb_table.offloads.fdb_chains_lock);
 }
 
 static int esw_create_offloads_table(struct mlx5_eswitch *esw, int nvports)
@@ -2016,7 +2520,6 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 		total_vports = num_vfs + MLX5_SPECIAL_VPORTS(esw->dev);
 
 	memset(&esw->fdb_table.offloads, 0, sizeof(struct offloads_fdb));
-	mutex_init(&esw->fdb_table.offloads.fdb_prio_lock);
 
 	err = esw_create_offloads_acl_tables(esw);
 	if (err)

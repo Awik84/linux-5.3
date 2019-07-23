@@ -59,8 +59,8 @@
 	MLX5_CAP_ESW_FLOWTABLE(dev, fdb_multi_path_to_table)
 
 #define FDB_MAX_CHAIN 3
-#define FDB_SLOW_PATH_CHAIN (FDB_MAX_CHAIN + 1)
 #define FDB_MAX_PRIO 16
+#define FDB_MAX_LEVEL 2
 
 struct vport_ingress {
 	struct mlx5_flow_table *acl;
@@ -154,12 +154,10 @@ struct mlx5_eswitch_fdb {
 			struct mlx5_flow_handle *miss_rule_multi;
 			int vlan_push_pop_refcount;
 
-			struct {
-				struct mlx5_flow_table *fdb;
-				u32 num_rules;
-			} fdb_prio[FDB_MAX_CHAIN + 1][FDB_MAX_PRIO + 1][PRIO_LEVELS];
-			/* Protects fdb_prio table */
-			struct mutex fdb_prio_lock;
+			struct rhashtable fdb_chains_ht;
+			struct rhashtable fdb_prios_ht;
+			/* Protects fdb_chains */
+			struct mutex fdb_chains_lock;
 
 			int fdb_left[ARRAY_SIZE(ESW_POOLS)];
 		} offloads;
@@ -325,10 +323,10 @@ mlx5_eswitch_del_fwd_rule(struct mlx5_eswitch *esw,
 bool
 mlx5_eswitch_prios_supported(struct mlx5_eswitch *esw);
 
-u16
+unsigned int
 mlx5_eswitch_get_prio_range(struct mlx5_eswitch *esw);
 
-u32
+unsigned int
 mlx5_eswitch_get_chain_range(struct mlx5_eswitch *esw);
 
 struct mlx5_flow_handle *
@@ -383,6 +381,7 @@ struct mlx5_esw_flow_attr {
 	u32	chain;
 	u16	prio;
 	u32	dest_chain;
+	bool slow_path;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
 };
 
@@ -590,8 +589,8 @@ static inline const u32 *mlx5_esw_query_functions(struct mlx5_core_dev *dev)
 static inline void mlx5_eswitch_update_num_of_vfs(struct mlx5_eswitch *esw, const int num_vfs) {}
 
 #define FDB_MAX_CHAIN 1
-#define FDB_SLOW_PATH_CHAIN (FDB_MAX_CHAIN + 1)
 #define FDB_MAX_PRIO 1
+#define FDB_MAX_LEVEL 1
 
 #endif /* CONFIG_MLX5_ESWITCH */
 
