@@ -145,10 +145,12 @@ mlx5_create_auto_grouped_flow_table(struct mlx5_flow_namespace *ns,
 				    u32 flags);
 
 struct mlx5_flow_table_attr {
+	bool unmanaged;
 	int prio;
 	int max_fte;
 	u32 level;
 	u32 flags;
+	struct mlx5_flow_table *next_ft;
 };
 
 struct mlx5_flow_table *
@@ -195,6 +197,7 @@ struct mlx5_flow_act {
 	u32 flags;
 	struct mlx5_fs_vlan vlan[MLX5_FS_VLAN_DEPTH];
 	struct ib_counters *counters;
+	bool ignore_level;
 };
 
 #define MLX5_DECLARE_FLOW_ACT(name) \

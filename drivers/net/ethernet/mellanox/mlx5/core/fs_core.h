@@ -145,6 +145,7 @@ struct mlx5_flow_table {
 	struct list_head		fwd_rules;
 	u32				flags;
 	struct rhltable			fgs_hash;
+	bool unmanaged;
 };
 
 struct mlx5_ft_underlay_qp {
@@ -232,6 +233,9 @@ void mlx5_fc_update_sampling_interval(struct mlx5_core_dev *dev,
 
 int mlx5_init_fs(struct mlx5_core_dev *dev);
 void mlx5_cleanup_fs(struct mlx5_core_dev *dev);
+
+int mlx5_set_flow_table_next(struct mlx5_flow_table *ft,
+			     struct mlx5_flow_table *next_ft);
 
 #define fs_get_obj(v, _node)  {v = container_of((_node), typeof(*v), node); }
 

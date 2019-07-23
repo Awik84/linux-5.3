@@ -388,6 +388,9 @@ static int mlx5_cmd_set_fte(struct mlx5_core_dev *dev,
 	MLX5_SET(set_fte_in, in, table_type, ft->type);
 	MLX5_SET(set_fte_in, in, table_id,   ft->id);
 	MLX5_SET(set_fte_in, in, flow_index, fte->index);
+	if (fte->action.ignore_level)
+		MLX5_SET(set_fte_in, in, ignore_flow_level, 1);
+
 	if (ft->vport) {
 		MLX5_SET(set_fte_in, in, vport_number, ft->vport);
 		MLX5_SET(set_fte_in, in, other_vport, 1);
@@ -417,7 +420,6 @@ static int mlx5_cmd_set_fte(struct mlx5_core_dev *dev,
 	}
 	MLX5_SET(flow_context, in_flow_context, modify_header_id,
 		 fte->action.modify_id);
-
 	vlan = MLX5_ADDR_OF(flow_context, in_flow_context, push_vlan);
 
 	MLX5_SET(vlan, vlan, ethtype, fte->action.vlan[0].ethtype);

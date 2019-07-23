@@ -678,7 +678,7 @@ static struct mlx5_flow_group *alloc_insert_flow_group(struct mlx5_flow_table *f
 static struct mlx5_flow_table *alloc_flow_table(int level, u16 vport, int max_fte,
 						enum fs_flow_table_type table_type,
 						enum fs_flow_table_op_mod op_mod,
-						u32 flags)
+						u32 flags, bool unmanaged)
 {
 	struct mlx5_flow_table *ft;
 	int ret;
@@ -700,6 +700,7 @@ static struct mlx5_flow_table *alloc_flow_table(int level, u16 vport, int max_ft
 	ft->vport = vport;
 	ft->max_fte = max_fte;
 	ft->flags = flags;
+	ft->unmanaged = unmanaged;
 	INIT_LIST_HEAD(&ft->fwd_rules);
 	mutex_init(&ft->lock);
 
@@ -771,6 +772,17 @@ static struct mlx5_flow_table *find_next_chained_ft(struct fs_prio *prio)
 static struct mlx5_flow_table *find_prev_chained_ft(struct fs_prio *prio)
 {
 	return find_closest_ft(prio, true);
+}
+
+int mlx5_set_flow_table_next(struct mlx5_flow_table *ft,
+			     struct mlx5_flow_table *next_ft)
+{
+	struct mlx5_flow_root_namespace *root = find_root(&ft->node);
+
+	if (!ft->unmanaged)
+		return -EOPNOTSUPP;
+
+	return root->cmds->modify_flow_table(root, ft, next_ft);
 }
 
 static int connect_fts_in_prio(struct mlx5_core_dev *dev,
@@ -976,7 +988,8 @@ static struct mlx5_flow_table *__mlx5_create_flow_table(struct mlx5_flow_namespa
 							u16 vport)
 {
 	struct mlx5_flow_root_namespace *root = find_root(&ns->node);
-	struct mlx5_flow_table *next_ft = NULL;
+	struct mlx5_flow_table *next_ft = ft_attr->unmanaged ?
+					  ft_attr->next_ft : NULL;
 	struct fs_prio *fs_prio = NULL;
 	struct mlx5_flow_table *ft;
 	int log_table_sz;
@@ -1005,7 +1018,7 @@ static struct mlx5_flow_table *__mlx5_create_flow_table(struct mlx5_flow_namespa
 			      vport,
 			      ft_attr->max_fte ? roundup_pow_of_two(ft_attr->max_fte) : 0,
 			      root->table_type,
-			      op_mod, ft_attr->flags);
+			      op_mod, ft_attr->flags, ft_attr->unmanaged);
 	if (IS_ERR(ft)) {
 		err = PTR_ERR(ft);
 		goto unlock_root;
@@ -1013,18 +1026,26 @@ static struct mlx5_flow_table *__mlx5_create_flow_table(struct mlx5_flow_namespa
 
 	tree_init_node(&ft->node, del_hw_flow_table, del_sw_flow_table);
 	log_table_sz = ft->max_fte ? ilog2(ft->max_fte) : 0;
-	next_ft = find_next_chained_ft(fs_prio);
+	if (!ft->unmanaged)
+		next_ft = find_next_chained_ft(fs_prio);
 	err = root->cmds->create_flow_table(root, ft, log_table_sz, next_ft);
 	if (err)
 		goto free_ft;
 
-	err = connect_flow_table(root->dev, ft, fs_prio);
-	if (err)
-		goto destroy_ft;
+	if (!ft->unmanaged) {
+		err = connect_flow_table(root->dev, ft, fs_prio);
+		if (err)
+			goto destroy_ft;
+	}
+
 	ft->node.active = true;
 	down_write_ref_node(&fs_prio->node, false);
-	tree_add_node(&ft->node, &fs_prio->node);
-	list_add_flow_table(ft, fs_prio);
+	if (!ft->unmanaged) {
+		tree_add_node(&ft->node, &fs_prio->node);
+		list_add_flow_table(ft, fs_prio);
+	} else {
+		ft->node.root = fs_prio->node.root;
+	}
 	fs_prio->num_ft++;
 	up_write_ref_node(&fs_prio->node, false);
 	mutex_unlock(&root->chain_lock);
@@ -1115,9 +1136,6 @@ struct mlx5_flow_group *mlx5_create_flow_group(struct mlx5_flow_table *ft,
 				 end_flow_index);
 	struct mlx5_flow_group *fg;
 	int err;
-
-	if (ft->autogroup.active)
-		return ERR_PTR(-EPERM);
 
 	down_write_ref_node(&ft->node, false);
 	fg = alloc_insert_flow_group(ft, match_criteria_enable, match_criteria,
@@ -1495,9 +1513,11 @@ static bool counter_is_valid(u32 action)
 }
 
 static bool dest_is_valid(struct mlx5_flow_destination *dest,
-			  u32 action,
+			  struct mlx5_flow_act *flow_act,
 			  struct mlx5_flow_table *ft)
 {
+	u32 action = flow_act->action;
+
 	if (dest && (dest->type == MLX5_FLOW_DESTINATION_TYPE_COUNTER))
 		return counter_is_valid(action);
 
@@ -1506,7 +1526,7 @@ static bool dest_is_valid(struct mlx5_flow_destination *dest,
 
 	if (!dest || ((dest->type ==
 	    MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE) &&
-	    (dest->ft->level <= ft->level)))
+	    (dest->ft->level <= ft->level && !flow_act->ignore_level)))
 		return false;
 	return true;
 }
@@ -1736,7 +1756,7 @@ _mlx5_add_flow_rules(struct mlx5_flow_table *ft,
 		return ERR_PTR(-EINVAL);
 
 	for (i = 0; i < dest_num; i++) {
-		if (!dest_is_valid(&dest[i], flow_act->action, ft))
+		if (!dest_is_valid(&dest[i], flow_act, ft))
 			return ERR_PTR(-EINVAL);
 	}
 	nested_down_read_ref_node(&ft->node, FS_LOCK_GRANDPARENT);
@@ -1998,7 +2018,8 @@ int mlx5_destroy_flow_table(struct mlx5_flow_table *ft)
 	int err = 0;
 
 	mutex_lock(&root->chain_lock);
-	err = disconnect_flow_table(ft);
+	if (!ft->unmanaged)
+		err = disconnect_flow_table(ft);
 	if (err) {
 		mutex_unlock(&root->chain_lock);
 		return err;
