@@ -855,10 +855,12 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 		      struct netlink_ext_ack *extack)
 {
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
-	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+	struct mlx5_tc_chains_offload *fdb_chains =
+			&esw->fdb_table.offloads.fdb_chains;
+	u32 max_chain = mlx5_tc_get_chain_range(fdb_chains);
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 	struct mlx5e_tc_flow_parse_attr *parse_attr = attr->parse_attr;
-	u16 max_prio = mlx5_eswitch_get_prio_range(esw);
+	u16 max_prio = mlx5_tc_get_prio_range(fdb_chains);
 	struct net_device *out_dev, *encap_dev = NULL;
 	bool ct_flow = flow_flag_test(flow, CT);
 	struct mlx5_fc *counter = NULL;
@@ -868,7 +870,7 @@ mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
 	int err = 0;
 	int out_index;
 
-	if (!mlx5_eswitch_prios_supported(esw) && attr->prio != 1) {
+	if (!TC_CHAIN_OFFLOAD_CHAINS_PRIOS_SUPPORT(fdb_chains) && attr->prio != 1) {
 		NL_SET_ERR_MSG(extack, "E-switch priorities unsupported, upgrade FW");
 		return -EOPNOTSUPP;
 	}
@@ -3029,6 +3031,8 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
 {
 	struct pedit_headers_action hdrs[2] = {};
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+	struct mlx5_tc_chains_offload *fdb_chains =
+			&esw->fdb_table.offloads.fdb_chains;
 	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
 	struct mlx5e_tc_flow_parse_attr *parse_attr = attr->parse_attr;
 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
@@ -3193,7 +3197,7 @@ static int parse_tc_fdb_actions(struct mlx5e_priv *priv,
 			break;
 		case FLOW_ACTION_GOTO: {
 			u32 dest_chain = act->chain_index;
-			u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+			u32 max_chain = mlx5_tc_get_chain_range(fdb_chains);
 
 			if (dest_chain <= attr->chain) {
 				NL_SET_ERR_MSG(extack, "Goto earlier chain isn't supported");
@@ -3957,4 +3961,639 @@ int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1)
 	}
 
 	return 0;
+}
+
+/* Flow Steering support for TC chains */
+static const struct rhashtable_params chain_params = {
+	.head_offset = offsetof(struct tc_chain, node),
+	.key_offset = offsetof(struct tc_chain, chain),
+	.key_len = sizeof(int),
+	.automatic_shrinking = true,
+};
+
+static const struct rhashtable_params prio_params = {
+	.head_offset = offsetof(struct tc_prio, node),
+	.key_offset = offsetof(struct tc_prio, chain),
+	.key_len = sizeof(u32) * 3,
+	.automatic_shrinking = true,
+};
+
+unsigned int mlx5_tc_get_chain_range(struct mlx5_tc_chains_offload *offload)
+{
+	if (!TC_CHAIN_OFFLOAD_CHAINS_PRIOS_SUPPORT(offload))
+		return 1;
+
+	if (TC_CHAIN_OFFLOAD_IGNORE_FLOW_LEVEL(offload))
+		return UINT_MAX;
+
+	return TC_MAX_CHAIN;
+}
+
+unsigned int mlx5_tc_get_prio_range(struct mlx5_tc_chains_offload *offload)
+{
+	if (!TC_CHAIN_OFFLOAD_CHAINS_PRIOS_SUPPORT(offload))
+		return 1;
+
+	if (TC_CHAIN_OFFLOAD_IGNORE_FLOW_LEVEL(offload))
+		return UINT_MAX;
+
+	return TC_MAX_PRIO;
+}
+
+unsigned int mlx5_tc_get_level_range(struct mlx5_tc_chains_offload *offload)
+{
+	if (!TC_CHAIN_OFFLOAD_CHAINS_PRIOS_SUPPORT(offload))
+		return 1;
+
+	if (TC_CHAIN_OFFLOAD_IGNORE_FLOW_LEVEL(offload))
+		return UINT_MAX;
+
+	return TC_MAX_LEVEL;
+}
+
+int init_tc_chains_offload(struct mlx5_core_dev *dev,
+			   struct mlx5_tc_chains_offload *offload,
+			   create_ft_cb ft_cb)
+{
+	int err;
+
+	mutex_init(&offload->chains_lock);
+	idr_init(&offload->chain_ids);
+
+	err = rhashtable_init(&offload->chains_ht, &chain_params);
+	if (err)
+		return err;
+
+	err = rhashtable_init(&offload->prios_ht, &prio_params);
+	if (err) {
+		rhashtable_destroy(&offload->chains_ht);
+		idr_destroy(&offload->chain_ids);
+		mutex_destroy(&offload->chains_lock);
+		return err;
+	}
+
+	/* Fill with based on FW cap per table type */
+	offload->flags |= MLX5_TC_IGNORE_FT_LEVEL;
+
+	offload->dev = dev;
+	offload->create_next_ft = ft_cb;
+
+	return 0;
+}
+
+void destroy_tc_chains_offload(struct mlx5_tc_chains_offload *offload)
+{
+	rhashtable_destroy(&offload->prios_ht);
+	rhashtable_destroy(&offload->chains_ht);
+	idr_destroy(&offload->chain_ids);
+	mutex_destroy(&offload->chains_lock);
+}
+
+static struct mlx5_flow_handle
+*add_hdr_restore_rule(struct mlx5_tc_chains_offload *offload, int tag)
+{
+	struct mlx5_flow_act flow_act = { .flags = FLOW_ACT_NO_APPEND, };
+	struct mlx5_flow_table *ft = offload->ft_offloads_restore;
+	struct mlx5_flow_context *flow_context;
+	struct mlx5_flow_spec s, *spec = &s;
+	struct mlx5_flow_handle *flow_rule;
+	struct mlx5_flow_destination dest;
+	void *misc;
+
+	memset(spec, 0, sizeof(*spec));
+	misc = MLX5_ADDR_OF(fte_match_param, spec->match_criteria, misc_parameters_2);
+	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, MAX_CHAIN_TAG);
+	misc = MLX5_ADDR_OF(fte_match_param, spec->match_value, misc_parameters_2);
+	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, tag);
+	spec->match_criteria_enable = MLX5_MATCH_MISC_PARAMETERS_2;
+	flow_act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST |
+		MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
+	flow_act.modify_id = offload->restore_copy_hdr_id;
+
+	flow_context = &spec->flow_context;
+	flow_context->flags |= FLOW_CONTEXT_HAS_TAG;
+	flow_context->flow_tag = tag;
+	dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+	dest.ft = offload->restore_dest_ft;
+	printk(KERN_ERR "%s %d %s @@ adding restore rule, tag: %d, copy_hdr_id: %d\n", __FILE__, __LINE__, __func__, tag, offload->restore_copy_hdr_id);
+	flow_rule = mlx5_add_flow_rules(ft, spec, &flow_act, &dest, 1);
+
+	if (IS_ERR(flow_rule))
+		esw_warn(offload->dev, "Failed to create restore rule for tag: %d, err(%d)\n", tag, (int) PTR_ERR(flow_rule));
+
+	return flow_rule;
+}
+
+static struct tc_chain *create_tc_chain(struct mlx5_tc_chains_offload *offload, u32 chain,
+					enum mlx5_flow_namespace_type ns_type)
+{
+	char modact[MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)];
+	struct tc_chain *tc_chain = NULL;
+	int err;
+
+	tc_chain = kvzalloc(sizeof(*tc_chain), GFP_KERNEL);
+	if (!tc_chain) {
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, -ENOMEM);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	tc_chain->chain = chain;
+	INIT_LIST_HEAD(&tc_chain->prios_list);
+
+	if (chain) {
+		u32 index = 1;
+
+		err = idr_alloc_u32(&offload->chain_ids, tc_chain, &index,
+				    MAX_CHAIN_TAG, GFP_KERNEL);
+		if (err) {
+			printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+			goto err_idr;
+		}
+		tc_chain->id = index;
+	}
+
+	MLX5_SET(set_action_in, modact, action_type, MLX5_ACTION_TYPE_SET);
+	MLX5_SET(set_action_in, modact, field, match_mappings[mp_chain].mfield);
+	MLX5_SET(set_action_in, modact, offset, match_mappings[mp_chain].moffset*8);
+	MLX5_SET(set_action_in, modact, length, match_mappings[mp_chain].mlen*8);
+	MLX5_SET(set_action_in, modact, data, tc_chain->id);
+	err = mlx5_modify_header_alloc(offload->dev, ns_type,
+				       1, modact, &tc_chain->miss_hdr_id);
+	printk(KERN_ERR "%s %d %s @@ chain: %d, created miss header: %d (tag: %d), err: %d\n", __FILE__, __LINE__, __func__, chain, tc_chain->miss_hdr_id, tc_chain->id, err);
+	if (err) {
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+		goto err_mod_hdr;
+	}
+
+	if (ns_type == MLX5_FLOW_NAMESPACE_FDB) {
+		tc_chain->restore_rule = add_hdr_restore_rule(offload, tc_chain->id);
+		if (IS_ERR(tc_chain->restore_rule)) {
+			err = PTR_ERR(tc_chain->restore_rule);
+			printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+			goto err_restore;
+		}
+	}
+
+	err = rhashtable_insert_fast(&offload->chains_ht, &tc_chain->node,
+				     chain_params);
+	if (err) {
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+		goto err_insert;
+	}
+
+	printk(KERN_ERR "%s %d %s @@ created new chain: %d\n", __FILE__, __LINE__, __func__, chain);
+	return tc_chain;
+
+err_insert:
+	if (tc_chain->restore_rule)
+		mlx5_del_flow_rules(tc_chain->restore_rule);
+err_restore:
+	mlx5_modify_header_dealloc(offload->dev, tc_chain->miss_hdr_id);
+err_mod_hdr:
+	if (tc_chain->id)
+		idr_remove(&offload->chain_ids, tc_chain->id); /* need to fix race with datapath here */
+err_idr:
+	kvfree(tc_chain);
+	return ERR_PTR(err);
+}
+
+static void destory_tc_chain(struct mlx5_tc_chains_offload *offload, struct tc_chain *tc_chain)
+{
+	printk(KERN_ERR "%s %d %s @@ destory chain: %d\n", __FILE__, __LINE__, __func__, tc_chain->chain);
+	rhashtable_remove_fast(&offload->chains_ht, &tc_chain->node,
+			       chain_params);
+	if (tc_chain->restore_rule);
+		mlx5_del_flow_rules(tc_chain->restore_rule);
+	mlx5_modify_header_dealloc(offload->dev, tc_chain->miss_hdr_id);
+	if (tc_chain->id)
+		idr_remove(&offload->chain_ids, tc_chain->id);
+	kvfree(tc_chain);
+}
+
+static struct tc_chain *get_tc_chain(struct mlx5_tc_chains_offload *offload, u32 chain,
+				     enum mlx5_flow_namespace_type type)
+{
+	struct tc_chain *tc_chain;
+
+	tc_chain = rhashtable_lookup_fast(&offload->chains_ht, &chain,
+					   chain_params);
+	if (!tc_chain) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, creating...\n", __FILE__, __LINE__, __func__, chain);
+		tc_chain = create_tc_chain(offload, chain, type);
+		if (IS_ERR(tc_chain))
+			return tc_chain;
+	}
+
+	tc_chain->ref++;
+	printk(KERN_ERR "%s %d %s @@ chain: %d, after ref: %d\n", __FILE__, __LINE__, __func__, chain, tc_chain->ref);
+
+	return tc_chain;
+}
+
+static void put_tc_chain(struct mlx5_tc_chains_offload *offload,
+			 struct tc_chain *tc_chain)
+{
+	printk(KERN_ERR "%s %d %s @@ chain: %d, ref before dec: %d\n", __FILE__, __LINE__, __func__, tc_chain->chain, tc_chain->ref);
+	if (--tc_chain->ref == 0) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, destroy\n", __FILE__, __LINE__, __func__, tc_chain->chain);
+		destory_tc_chain(offload, tc_chain);
+	}
+}
+
+
+#define prio_fmt "%px (chain: %d, prio: %d, level: %d)"
+#define prio_fmt_s "(%d, %d, %d)"
+#define prio_print(tc_prio) (tc_prio), (tc_prio)->chain, (tc_prio)->prio, (tc_prio)->level
+#define prio_print_s(tc_prio) (tc_prio)->chain, (tc_prio)->prio, (tc_prio)->level
+#define prio_from_list(l) list_entry(l, struct tc_prio, list)
+#define prio_list_params(l) (prio_from_list(l)), (prio_from_list(l))->chain, (prio_from_list(l))->prio, (prio_from_list(l))->level
+static struct tc_prio *create_tc_prio(struct mlx5_tc_chains_offload *offload,
+					u32 chain, u32 prio, u32 level,
+					enum mlx5_flow_namespace_type type)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	struct mlx5_flow_destination dest = {};
+	struct mlx5_flow_handle *miss_rule = NULL;
+	struct tc_prio *tc_prio = NULL;
+	struct mlx5_flow_spec spec = {};
+	struct mlx5_flow_table *next_ft;
+	struct mlx5_flow_act act = {0};
+	struct tc_chain *tc_chain;
+	struct list_head *pos;
+	u32 *flow_group_in;
+	int err;
+
+	tc_chain = get_tc_chain(offload, chain, type);
+	if (IS_ERR(tc_chain))
+		return ERR_CAST(tc_chain);
+
+	tc_prio = kvzalloc(sizeof(*tc_prio), GFP_KERNEL);
+	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
+	if (!tc_prio || !flow_group_in) {
+		err = -ENOMEM;
+		printk(KERN_ERR "%s %d %s @@ err: %d\n", __FILE__, __LINE__, __func__, err);
+		goto err_alloc;
+	}
+
+	tc_prio->chain = chain;
+	tc_prio->prio = prio;
+	tc_prio->level = level;
+	tc_prio->tc_chain = tc_chain;
+
+	/* prio list is sorted by prio and level, and for each
+	 * prio we expect to have level 0 (expected to be handled by user of
+	 * this API), example list: (3,0)->(3,2)->(5,0)->(5,3)->(7,0)
+	 * All levels point to next prio level 0.
+	 * In hardware, we will we have the following pointers:
+	 * (3,0) -> (5,0) -> (7,0)
+	 * (3,2) -> (5,0)
+	 * (5,3) -> (7,0)
+	 * */
+	next_ft = offload->miss_ft;
+	list_for_each(pos, &tc_chain->prios_list) {
+		struct tc_prio *p = list_entry(pos, struct tc_prio, list);
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt_s" < "prio_fmt_s"?\n", __FILE__, __LINE__, __func__, prio_print_s(tc_prio), prio_print_s(p));
+		if (prio < p->prio || (prio == p->prio && level < p->level)) /* exit on first that is largest */
+		{
+			next_ft = (p->level == 0) ? p->ft : p->next_ft;
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" break\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+			break;
+		}
+	}
+	tc_prio->next_ft = next_ft;
+
+	/*if (pos != &tc_chain->prios_list) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" next "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), prio_list_params(pos));
+		next_ft = list_entry(pos, struct tc_prio, list)->ft;
+	} else {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" next is slow \n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+		next_ft = offload->miss_ft;
+	}*/
+
+	tc_prio->ft = offload->create_next_ft(offload, tc_chain->chain,
+					      prio, level, offload->miss_ft);
+	if (IS_ERR(tc_prio->ft)) {
+		err = PTR_ERR(tc_prio->ft);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(tc_prio), err);
+		goto err_create;
+	}
+
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" ft: %px, tc_prio->ft autogroups: %d, creating group\n", __FILE__, __LINE__, __func__,
+				     prio_print(tc_prio), tc_prio->ft, tc_prio->ft->autogroup.active);
+	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, tc_prio->ft->max_fte-3);
+	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, tc_prio->ft->max_fte-1);
+	tc_prio->miss_group = mlx5_create_flow_group(tc_prio->ft,
+						     flow_group_in);
+	tc_prio->ft->autogroup.num_groups++;
+	if (IS_ERR(tc_prio->miss_group)) {
+		err = PTR_ERR(tc_prio->miss_group);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(tc_prio), err);
+		goto err_group;
+	}
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" fg: %px (id: %d)\n", __FILE__, __LINE__, __func__, prio_print(tc_prio),  tc_prio->miss_group, tc_prio->miss_group->id);
+
+	/* We handle miss rules just for level 0 tables and we expect
+	 * level 0 to be added first for each prio, other levels are
+	 * ignored. */
+	if (!level && (next_ft == offload->miss_ft)) { /* if next is miss table */
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" creating miss rule to offload->miss_ft, using miss hdr: %d\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_chain->miss_hdr_id);
+		memset(&act, 0, sizeof(act));
+		act.action = MLX5_FLOW_CONTEXT_ACTION_MOD_HDR |
+			     MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+		act.modify_id = tc_chain->miss_hdr_id;
+		act.ignore_level = true;
+		act.flags = FLOW_ACT_NO_APPEND;
+		dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+		dest.ft = offload->miss_ft;
+		miss_rule = mlx5_add_flow_rules(tc_prio->ft, &spec, &act,
+						&dest, 1);
+		if (IS_ERR(miss_rule)) {
+			err = PTR_ERR(miss_rule);
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(tc_prio), err);
+			goto err_miss_rule;
+		}
+
+		tc_prio->miss_rule = miss_rule;
+	} else if (!level) {
+		memset(&act, 0, sizeof(act));
+		act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+		act.ignore_level = true;
+		act.flags = FLOW_ACT_NO_APPEND;
+		dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+		dest.ft = next_ft;
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" creating miss rule to next ft %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), next_ft);
+		miss_rule = mlx5_add_flow_rules(tc_prio->ft, &spec, &act,
+						&dest, 1);
+		if (IS_ERR(miss_rule)) {
+			err = PTR_ERR(miss_rule);
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" err: %d\n",  __FILE__, __LINE__, __func__, prio_print(tc_prio), err);
+			goto err_miss_rule;
+		}
+
+		tc_prio->miss_rule = miss_rule;
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss_rule: %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->miss_rule);
+	}
+
+	if (!level && pos->prev != &tc_chain->prios_list) {
+		/* update prev */
+		struct tc_prio *pos_prio = list_entry(pos,
+						       struct tc_prio,
+						       list);
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" update prevs\n",  __FILE__, __LINE__, __func__, prio_print(tc_prio));
+		list_for_each_entry_continue_reverse(pos_prio,
+						     &tc_chain->prios_list,
+						     list) {
+			if (pos_prio->level)
+				continue;
+
+			printk(KERN_ERR "%s %d %s @@ updating "prio_fmt" to point to "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), prio_print(tc_prio));
+
+			memset(&act, 0, sizeof(act));
+			act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+			act.ignore_level = true;
+			act.flags = FLOW_ACT_NO_APPEND;
+			dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+			dest.ft = tc_prio->ft;
+			miss_rule = mlx5_add_flow_rules(pos_prio->ft, &spec, &act,
+							&dest, 1);
+			if (IS_ERR(miss_rule)) {
+				err = PTR_ERR(miss_rule);
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" error adding miss rule: %d\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), err);
+				miss_rule = NULL;
+				goto err_prev_rule;
+			}
+
+			if (pos_prio->miss_rule) {
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule %px\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), pos_prio->miss_rule);
+				mlx5_del_flow_rules(pos_prio->miss_rule);
+			} else {
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rulle?\n", __FILE__, __LINE__, __func__, prio_print(pos_prio));
+			}
+
+			pos_prio->miss_rule = miss_rule;
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss_rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos_prio), pos_prio->miss_rule);
+			break;
+
+			/*
+			WARN_ON(mlx5_set_flow_table_next(pos_prio->fdb,
+							 tc_prio->fdb));
+			*/
+		}
+	}
+
+	list_add(&tc_prio->list, pos->prev);
+
+	{
+		char list[256] = "";
+		struct tc_prio *t;
+
+		list_for_each_entry(t, &tc_chain->prios_list, list) {
+			sprintf(list, "%s "prio_fmt_s"", list, prio_print_s(t));
+		}
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" list: %s\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), list);
+	}
+
+	err = rhashtable_insert_fast(&offload->prios_ht, &tc_prio->node,
+				     prio_params);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" add to prios_ht: %d\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), err);
+
+	kvfree(flow_group_in);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" created\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+	return tc_prio;
+
+err_prev_rule:
+	if (miss_rule)
+		mlx5_del_flow_rules(miss_rule);
+err_miss_rule:
+	mlx5_destroy_flow_group(tc_prio->miss_group);
+err_group:
+	mlx5_destroy_flow_table(tc_prio->ft);
+err_create:
+err_alloc:
+	printk(KERN_ERR "%s %d %s @@ %d\n", __FILE__, __LINE__, __func__, err);
+	kvfree(tc_prio);
+	kvfree(flow_group_in);
+	put_tc_chain(offload, tc_chain);
+	return ERR_PTR(err);
+}
+
+struct mlx5_flow_table *
+mlx5_tc_chain_get_prio_table(struct mlx5_tc_chains_offload *offload,
+			     u32 chain, u32 prio, u32 level,
+			     enum mlx5_flow_namespace_type type)
+{
+	struct tc_prio *tc_prio;
+	struct {
+		u32 chain;
+		u32 prio;
+		u32 level;
+	} key = { chain, prio, level };
+
+	if (chain > mlx5_tc_get_chain_range(offload) ||
+	    prio > mlx5_tc_get_prio_range(offload) ||
+	    level > mlx5_tc_get_level_range(offload))
+		return ERR_PTR(-EOPNOTSUPP);
+
+	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d\n", __FILE__, __LINE__, __func__, chain, prio, level);
+
+	mutex_lock(&offload->chains_lock);
+	tc_prio = rhashtable_lookup_fast(&offload->prios_ht, &key,
+					 prio_params);
+	if (!tc_prio) {
+		printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d, creating...\n", __FILE__, __LINE__, __func__, chain, prio, level);
+		tc_prio = create_tc_prio(offload, chain, prio, level, type);
+		if (IS_ERR(tc_prio))
+			goto err_create_prio;
+	}
+
+	++tc_prio->ref;
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" before inc %d, fdb: %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->ref, tc_prio->ft);
+	mutex_unlock(&offload->chains_lock);
+
+	return tc_prio->ft;
+
+err_create_prio:
+	mutex_unlock(&offload->chains_lock);
+	return ERR_CAST(tc_prio);
+}
+
+static void destory_tc_prio(struct mlx5_tc_chains_offload *offload, struct tc_prio *tc_prio)
+{
+	struct tc_chain *tc_chain = tc_prio->tc_chain;
+	struct list_head *next = tc_prio->list.next;
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt"\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+
+	if (!tc_prio->level) {
+		struct mlx5_flow_destination dest = {};
+		struct mlx5_flow_handle *miss_rule;
+		struct mlx5_flow_spec spec = {};
+		struct mlx5_flow_act act = {0};
+		struct tc_prio *pos = tc_prio;
+
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" - update prevs\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+		if (next == &tc_chain->prios_list) {
+			printk(KERN_ERR "%s %d %s @@ "prio_fmt" was max updating chain miss rule\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+			list_for_each_entry_continue_reverse(pos,
+							     &tc_chain->prios_list,
+							     list) {
+				if (pos->level)
+					continue;
+
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" moving it to point to slow path, using mod hdr: %d\n", __FILE__, __LINE__, __func__, prio_print(pos), tc_chain->miss_hdr_id);
+				memset(&act, 0, sizeof(act));
+				act.action = MLX5_FLOW_CONTEXT_ACTION_MOD_HDR |
+					     MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+				act.modify_id = tc_chain->miss_hdr_id;
+				act.ignore_level = true;
+				act.flags = FLOW_ACT_NO_APPEND;
+				dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+				dest.ft = offload->miss_ft;
+				miss_rule = mlx5_add_flow_rules(pos->ft, &spec, &act,
+								&dest, 1);
+				if (WARN_ON(IS_ERR(miss_rule))) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" out of sync: %d\n", __FILE__, __LINE__, __func__, prio_print(pos), (int) PTR_ERR(miss_rule));
+					break;
+				}
+
+				if (pos->miss_rule) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+					mlx5_del_flow_rules(pos->miss_rule);
+				} else {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rule!\n", __FILE__, __LINE__, __func__, prio_print(pos));
+				}
+				pos->miss_rule = miss_rule;
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+				break;
+			}
+		} else {
+			struct tc_prio *next_prio = list_entry(next, struct tc_prio, list);
+
+			list_for_each_entry_continue_reverse(pos,
+						             &tc_chain->prios_list,
+							     list) {
+				if (pos->level)
+					continue;
+
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" updating miss to -> "prio_fmt")\n", __FILE__, __LINE__, __func__, prio_print(pos), prio_print(next_prio));
+
+				memset(&act, 0, sizeof(act));
+				act.action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
+				act.ignore_level = true;
+				act.flags = FLOW_ACT_NO_APPEND;
+				dest.type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
+				dest.ft = next_prio->ft;
+				miss_rule = mlx5_add_flow_rules(pos->ft, &spec, &act,
+								&dest, 1);
+				if (IS_ERR(miss_rule)) {
+					int err = PTR_ERR(miss_rule);
+
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" error adding miss rule %d\n", __FILE__, __LINE__, __func__, prio_print(pos), err);
+					break;
+				}
+
+				if (pos->miss_rule) {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+					mlx5_del_flow_rules(pos->miss_rule);
+				} else {
+					printk(KERN_ERR "%s %d %s @@ "prio_fmt" no miss rule!\n", __FILE__, __LINE__, __func__, prio_print(pos));
+				}
+				pos->miss_rule = miss_rule;
+				printk(KERN_ERR "%s %d %s @@ "prio_fmt" setting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(pos), pos->miss_rule);
+				break;
+			}
+		}
+	}
+
+	rhashtable_remove_fast(&offload->prios_ht, &tc_prio->node,
+			       prio_params);
+	list_del(&tc_prio->list);
+
+	if (!tc_prio->level) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss rule: %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->miss_rule);
+		mlx5_del_flow_rules(tc_prio->miss_rule);
+	}
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting miss group: %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->miss_group);
+	mlx5_destroy_flow_group(tc_prio->miss_group);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" deleting ft: %px\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->ft);
+	mlx5_destroy_flow_table(tc_prio->ft);
+
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" put chain\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+	put_tc_chain(offload, tc_chain);
+	printk(KERN_ERR "%s %d %s @@ "prio_fmt" free\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+	kvfree(tc_prio);
+}
+
+void
+mlx5_tc_chain_put_prio_table(struct mlx5_tc_chains_offload *offload,
+			     u32 chain, u32 prio, u32 level)
+{
+	struct tc_prio *tc_prio;
+	struct {
+		u32 chain;
+		u32 prio;
+		u32 level;
+	} key = { chain, prio, level };
+
+	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d: level: %d, destroy...\n", __FILE__, __LINE__, __func__, chain, prio, level);
+
+	mutex_lock(&offload->chains_lock);
+	tc_prio = rhashtable_lookup_fast(&offload->prios_ht, &key,
+					  prio_params);
+	if (!tc_prio)
+		goto err_get_prio;
+
+	printk(KERN_ERR "%s %d %s @ "prio_fmt" ref before dec: %d\n", __FILE__, __LINE__, __func__, prio_print(tc_prio), tc_prio->ref);
+	if (--tc_prio->ref == 0) {
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" destroy...\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+		destory_tc_prio(offload, tc_prio);
+		printk(KERN_ERR "%s %d %s @@ "prio_fmt" destroy... done\n", __FILE__, __LINE__, __func__, prio_print(tc_prio));
+	}
+	mutex_unlock(&offload->chains_lock);
+	return;
+
+err_get_prio:
+	mutex_unlock(&offload->chains_lock);
+	WARN_ON(1);
 }

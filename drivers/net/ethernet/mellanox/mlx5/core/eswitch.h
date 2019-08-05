@@ -41,6 +41,8 @@
 #include <linux/mlx5/vport.h>
 #include <linux/mlx5/fs.h>
 #include "lib/mpfs.h"
+#include "fs_core.h"
+#include "en_tc_chains.h"
 
 #ifdef CONFIG_MLX5_ESWITCH
 
@@ -126,10 +128,6 @@ struct mlx5_vport {
 	u16                     enabled_events;
 };
 
-enum offloads_fdb_flags {
-	ESW_FDB_CHAINS_AND_PRIOS_SUPPORTED = BIT(0),
-};
-
 extern const unsigned int ESW_POOLS[4];
 
 #define PRIO_LEVELS 2
@@ -155,24 +153,14 @@ struct mlx5_eswitch_fdb {
 			struct mlx5_flow_handle *miss_rule_multi;
 			int vlan_push_pop_refcount;
 
-			struct idr chain_ids;
-			struct rhashtable fdb_chains_ht;
-			struct rhashtable fdb_prios_ht;
-			/* Protects fdb_chains */
-			struct mutex fdb_chains_lock;
+			struct mlx5_tc_chains_offload fdb_chains;
 
 			int fdb_left[ARRAY_SIZE(ESW_POOLS)];
 		} offloads;
 	};
-	u32 flags;
 };
 
 struct mlx5_esw_offload {
-	struct mlx5_flow_table *ft_offloads_restore;
-	struct mlx5_flow_group *restore_group;
-	struct mlx5_flow_handle **restore_rules;
-	int restore_copy_hdr_id;
-
 	struct mlx5_flow_table *ft_offloads;
 	struct mlx5_flow_group *vport_rx_group;
 	struct mlx5_eswitch_rep *vport_reps;
@@ -327,15 +315,6 @@ void
 mlx5_eswitch_del_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_handle *rule,
 			  struct mlx5_esw_flow_attr *attr);
-
-bool
-mlx5_eswitch_prios_supported(struct mlx5_eswitch *esw);
-
-unsigned int
-mlx5_eswitch_get_prio_range(struct mlx5_eswitch *esw);
-
-unsigned int
-mlx5_eswitch_get_chain_range(struct mlx5_eswitch *esw);
 
 struct mlx5_flow_handle *
 mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
