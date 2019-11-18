@@ -62,6 +62,7 @@
 #include "en/xsk/setup.h"
 #include "en/xsk/rx.h"
 #include "en/xsk/tx.h"
+#include "en/tc_ct.h"
 
 
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
@@ -3433,6 +3434,9 @@ static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
 					   flags);
 	case FLOW_CLS_STATS:
 		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
+					  flags);
+	case FLOW_CLS_MISS:
+		return mlx5e_configure_ct(priv->netdev, priv, cls_flower,
 					  flags);
 	default:
 		return -EOPNOTSUPP;

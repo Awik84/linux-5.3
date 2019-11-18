@@ -1021,11 +1021,16 @@ static inline void mlx5e_complete_rx_cqe(struct mlx5e_rq *rq,
 					 struct sk_buff *skb)
 {
 	struct mlx5e_rq_stats *stats = rq->stats;
+	int (*update_hook)(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
 
 	stats->packets++;
 	stats->bytes += cqe_bcnt;
 	mlx5e_build_rx_skb(cqe, cqe_bcnt, rq, skb);
-	mlx5e_update_skb(skb, (be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK), be32_to_cpu(cqe->imm_inval_pkey));
+	rcu_read_lock();
+	update_hook = rcu_dereference(tc_skb_update_hook);
+	if (update_hook)
+		update_hook(skb, (be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK), be32_to_cpu(cqe->imm_inval_pkey));
+	rcu_read_unlock();
 }
 
 static inline

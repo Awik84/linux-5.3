@@ -63,7 +63,7 @@ static struct mlx5_eswitch_rep *mlx5_eswitch_get_rep(struct mlx5_eswitch *esw,
 static void
 mlx5_eswitch_set_rule_source_port(struct mlx5_eswitch *esw,
 				  struct mlx5_flow_spec *spec,
-				  struct mlx5_esw_flow_attr *attr)
+				  struct mlx5_flow_attr *attr)
 {
 	void *misc2;
 	void *misc;
@@ -110,7 +110,7 @@ mlx5_eswitch_set_rule_source_port(struct mlx5_eswitch *esw,
 struct mlx5_flow_handle *
 mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 				struct mlx5_flow_spec *spec,
-				struct mlx5_esw_flow_attr *attr)
+				struct mlx5_flow_attr *attr)
 {
 	struct mlx5_tc_chains_offload *fdb_chains = &esw->fdb_table.offloads.fdb_chains;
 	struct mlx5_flow_destination dest[MLX5_MAX_FLOW_FWD_VPORTS + 1] = {};
@@ -199,7 +199,7 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 	fdb = mlx5_tc_chain_get_prio_table(fdb_chains,
 					   attr->chain, attr->prio, !!split,
 					   MLX5_FLOW_NAMESPACE_FDB);
-	printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d (split: %d), got fdb: %px\n", __FILE__, __LINE__, __func__, attr->chain, attr->prio, split, fdb);
+	//printk(KERN_ERR "%s %d %s @@ chain: %d, prio: %d (split: %d), got fdb: %px\n", __FILE__, __LINE__, __func__, attr->chain, attr->prio, split, fdb);
 	if (IS_ERR(fdb)) {
 		rule = ERR_CAST(fdb);
 		goto err_esw_get;
@@ -210,10 +210,12 @@ mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 						     &flow_act, dest, i);
 	else
 		rule = mlx5_add_flow_rules(fdb, spec, &flow_act, dest, i);
-	if (IS_ERR(rule))
+	if (IS_ERR(rule)) {
+		mlx5_core_err(esw->dev, "Failed to add offloaded FDB rule\n");
 		goto err_add_rule;
-	else
+	} else {
 		esw->offloads.num_flows++;
+	}
 
 	return rule;
 
@@ -231,7 +233,7 @@ err_create_goto_table:
 struct mlx5_flow_handle *
 mlx5_eswitch_add_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_spec *spec,
-			  struct mlx5_esw_flow_attr *attr)
+			  struct mlx5_flow_attr *attr)
 {
 	struct mlx5_tc_chains_offload *fdb_chains = &esw->fdb_table.offloads.fdb_chains;
 	struct mlx5_flow_destination dest[MLX5_MAX_FLOW_FWD_VPORTS + 1] = {};
@@ -299,7 +301,7 @@ err_get_fast:
 static void
 __mlx5_eswitch_del_rule(struct mlx5_eswitch *esw,
 			struct mlx5_flow_handle *rule,
-			struct mlx5_esw_flow_attr *attr,
+			struct mlx5_flow_attr *attr,
 			bool fwd_rule)
 {
 	struct mlx5_tc_chains_offload *fdb_chains = &esw->fdb_table.offloads.fdb_chains;
@@ -333,7 +335,7 @@ __mlx5_eswitch_del_rule(struct mlx5_eswitch *esw,
 void
 mlx5_eswitch_del_offloaded_rule(struct mlx5_eswitch *esw,
 				struct mlx5_flow_handle *rule,
-				struct mlx5_esw_flow_attr *attr)
+				struct mlx5_flow_attr *attr)
 {
 	__mlx5_eswitch_del_rule(esw, rule, attr, false);
 }
@@ -341,7 +343,7 @@ mlx5_eswitch_del_offloaded_rule(struct mlx5_eswitch *esw,
 void
 mlx5_eswitch_del_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_handle *rule,
-			  struct mlx5_esw_flow_attr *attr)
+			  struct mlx5_flow_attr *attr)
 {
 	__mlx5_eswitch_del_rule(esw, rule, attr, true);
 }
@@ -366,7 +368,7 @@ out:
 }
 
 static struct mlx5_eswitch_rep *
-esw_vlan_action_get_vport(struct mlx5_esw_flow_attr *attr, bool push, bool pop)
+esw_vlan_action_get_vport(struct mlx5_flow_attr *attr, bool push, bool pop)
 {
 	struct mlx5_eswitch_rep *in_rep, *out_rep, *vport = NULL;
 
@@ -383,7 +385,7 @@ esw_vlan_action_get_vport(struct mlx5_esw_flow_attr *attr, bool push, bool pop)
 	return vport;
 }
 
-static int esw_add_vlan_action_check(struct mlx5_esw_flow_attr *attr,
+static int esw_add_vlan_action_check(struct mlx5_flow_attr *attr,
 				     bool push, bool pop, bool fwd)
 {
 	struct mlx5_eswitch_rep *in_rep, *out_rep;
@@ -418,7 +420,7 @@ out_notsupp:
 }
 
 int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_esw_flow_attr *attr)
+				 struct mlx5_flow_attr *attr)
 {
 	struct offloads_fdb *offloads = &esw->fdb_table.offloads;
 	struct mlx5_eswitch_rep *vport = NULL;
@@ -482,7 +484,7 @@ out:
 }
 
 int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_esw_flow_attr *attr)
+				 struct mlx5_flow_attr *attr)
 {
 	struct offloads_fdb *offloads = &esw->fdb_table.offloads;
 	struct mlx5_eswitch_rep *vport = NULL;
@@ -1012,6 +1014,12 @@ static int esw_create_offloads_fdb_tables(struct mlx5_eswitch *esw, int nvports)
 	if (err)
 		return err;
 
+	/* Create chain/tunnel id restore table */
+	err = mlx5_create_restore_table(fdb_chains,
+					MLX5_FLOW_NAMESPACE_OFFLOADS, 0);
+	if (err)
+		goto restore_err;
+
 	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
 	if (!flow_group_in)
 		goto alloc_err;
@@ -1196,6 +1204,8 @@ slow_fdb_err:
 ns_err:
 	kvfree(flow_group_in);
 alloc_err:
+	mlx5_destroy_restore_table(fdb_chains);
+restore_err:
 	destroy_tc_chains_offload(fdb_chains);
 	return err;
 }
@@ -1219,6 +1229,7 @@ static void esw_destroy_offloads_fdb_tables(struct mlx5_eswitch *esw)
 	mlx5_tc_chain_put_prio_table(fdb_chains, 0, 1, 0);
 	mlx5_destroy_flow_table(esw->fdb_table.offloads.slow_fdb);
 
+	mlx5_destroy_restore_table(fdb_chains);
 	destroy_tc_chains_offload(&esw->fdb_table.offloads.fdb_chains);
 }
 
@@ -1249,15 +1260,6 @@ static int esw_create_offloads_table(struct mlx5_eswitch *esw, int nvports)
 	esw->fdb_table.offloads.fdb_chains.restore_dest_ft = ft_offloads;
 
 	return 0;
-}
-
-static void esw_destroy_restore_table(struct mlx5_eswitch *esw)
-{
-	struct mlx5_tc_chains_offload *fdb_chains = &esw->fdb_table.offloads.fdb_chains;
-
-	mlx5_modify_header_dealloc(fdb_chains->dev, fdb_chains->restore_copy_hdr_id);
-	mlx5_destroy_flow_group(fdb_chains->restore_group);
-	mlx5_destroy_flow_table(fdb_chains->ft_offloads_restore);
 }
 
 static void esw_destroy_offloads_table(struct mlx5_eswitch *esw)
@@ -1349,85 +1351,6 @@ mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
 out:
 	kvfree(spec);
 	return flow_rule;
-}
-
-static int esw_create_restore_table(struct mlx5_eswitch *esw)
-{
-	//struct mlx5_flow_act flow_act = { .flags = FLOW_ACT_NO_APPEND, };
-	char modact[MLX5_UN_SZ_BYTES(set_action_in_add_action_in_auto)];
-	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
-	struct mlx5_flow_table_attr ft_attr = {};
-	struct mlx5_core_dev *dev = esw->dev;
-	struct mlx5_flow_namespace *ns;
-	void *match_criteria, *misc;
-	struct mlx5_flow_table *ft;
-	struct mlx5_flow_group *g;
-	int mod_hdr_id, err = 0;
-	u32 *flow_group_in;
-
-	ns = mlx5_get_flow_namespace(dev, MLX5_FLOW_NAMESPACE_OFFLOADS);
-	if (!ns) {
-		esw_warn(esw->dev, "Failed to get offloads flow namespace\n");
-		return -EOPNOTSUPP;
-	}
-
-	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
-	if (!flow_group_in) {
-		err = -ENOMEM;
-		goto out_free;
-	}
-
-	ft_attr.max_fte = MAX_CHAIN_TAG;
-	ft = mlx5_create_flow_table(ns, &ft_attr);
-	if (IS_ERR(ft)) {
-		err = PTR_ERR(ft);
-		esw_warn(esw->dev, "Failed to create restore table, err %d\n", err);
-		goto out_free;
-	}
-
-	memset(flow_group_in, 0, inlen);
-	MLX5_SET(create_flow_group_in, flow_group_in, match_criteria_enable,
-		 MLX5_MATCH_MISC_PARAMETERS_2);
-
-	match_criteria = MLX5_ADDR_OF(create_flow_group_in, flow_group_in, match_criteria);
-	misc = MLX5_ADDR_OF(fte_match_param, match_criteria, misc_parameters_2);
-	MLX5_SET(fte_match_set_misc2, misc, metadata_reg_c_0, MAX_CHAIN_TAG);
-	MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, 0);
-	MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, ft_attr.max_fte - 1);
-	g = mlx5_create_flow_group(ft, flow_group_in);
-	if (IS_ERR(g)) {
-		err = PTR_ERR(g);
-		esw_warn(dev, "Failed to create restore flow group err(%d)\n", err);
-		goto err_group;
-	}
-
-	MLX5_SET(copy_action_in, modact, action_type, MLX5_ACTION_TYPE_COPY);
-	MLX5_SET(copy_action_in, modact, src_field, MLX5_ACTION_IN_FIELD_METADATA_REG_C_1);
-	MLX5_SET(copy_action_in, modact, src_offset, 0);
-	MLX5_SET(copy_action_in, modact, dst_field, MLX5_ACTION_IN_FIELD_METADATA_REG_B);
-	MLX5_SET(copy_action_in, modact, dst_offset, 0);
-	MLX5_SET(copy_action_in, modact, length, 0);
-	err = mlx5_modify_header_alloc(esw->dev, MLX5_FLOW_NAMESPACE_KERNEL, 1, modact, &mod_hdr_id);
-	if (err) {
-		esw_warn(dev, "Failed to create restore mod header err(%d)\n", err);
-		goto err_mod_hdr;
-	}
-
-	esw->fdb_table.offloads.fdb_chains.ft_offloads_restore = ft;
-	esw->fdb_table.offloads.fdb_chains.restore_group = g;
-	esw->fdb_table.offloads.fdb_chains.restore_copy_hdr_id = mod_hdr_id;
-
-	return 0;
-
-	//mlx5_modify_header_dealloc(esw->dev, mod_hdr_id);
-err_mod_hdr:
-	mlx5_destroy_flow_group(g);
-err_group:
-	mlx5_destroy_flow_table(ft);
-out_free:
-	kvfree(flow_group_in);
-
-	return err;
 }
 
 static int esw_offloads_start(struct mlx5_eswitch *esw,
@@ -2095,10 +2018,6 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 	if (err)
 		goto create_offloads_err;
 
-	err = esw_create_restore_table(esw);
-	if (err)
-		goto create_restore_err;
-
 	err = esw_create_offloads_fdb_tables(esw, total_vports);
 	if (err)
 		goto create_fdb_err;
@@ -2112,8 +2031,6 @@ static int esw_offloads_steering_init(struct mlx5_eswitch *esw)
 create_fg_err:
 	esw_destroy_offloads_fdb_tables(esw);
 create_fdb_err:
-	esw_destroy_restore_table(esw);
-create_restore_err:
 	esw_destroy_offloads_table(esw);
 create_offloads_err:
 	esw_destroy_offloads_acl_tables(esw);
@@ -2123,9 +2040,11 @@ create_offloads_err:
 
 static void esw_offloads_steering_cleanup(struct mlx5_eswitch *esw)
 {
+	struct mlx5_tc_chains_offload *fdb_chains = &esw->fdb_table.offloads.fdb_chains;
+
 	esw_destroy_vport_rx_group(esw);
 	esw_destroy_offloads_fdb_tables(esw);
-	esw_destroy_restore_table(esw);
+	mlx5_destroy_restore_table(fdb_chains);
 	esw_destroy_offloads_table(esw);
 	esw_destroy_offloads_acl_tables(esw);
 }
@@ -2652,18 +2571,3 @@ u32 mlx5_eswitch_get_vport_metadata_for_match(const struct mlx5_eswitch *esw,
 	return ((MLX5_CAP_GEN(esw->dev, vhca_id) & 0xff) | vport_num) << 16;
 }
 EXPORT_SYMBOL(mlx5_eswitch_get_vport_metadata_for_match);
-
-u32 mlx5_eswitch_get_chain_for_tag(struct mlx5_eswitch *esw, u32 tag)
-{
-	struct mlx5_tc_chains_offload *fdb_chains =
-			&esw->fdb_table.offloads.fdb_chains;
-	struct tc_chain *tc_chain;
-
-	tc_chain = idr_find(&fdb_chains->chain_ids, tag & MAX_CHAIN_TAG);
-	if (!tc_chain) {
-		printk(KERN_ERR "%s %d %s @@ can't find tag: %d\n", __FILE__, __LINE__, __func__, tag & MAX_CHAIN_TAG);
-		return 0;
-	}
-
-	return tc_chain->chain;
-}

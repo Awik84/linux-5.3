@@ -43,7 +43,7 @@
 #include "en.h"
 #include "en/fs.h"
 
-struct mlx5_nic_flow_attr {
+/*struct mlx5_nic_flow_attr {
 	u32 action;
 	u32 flow_tag;
 	u32 mod_hdr_id;
@@ -51,7 +51,10 @@ struct mlx5_nic_flow_attr {
 	u8 match_level;
 	struct mlx5_flow_table	*hairpin_ft;
 	struct mlx5_fc		*counter;
-};
+	u32 chain;
+	u16 prio;
+	u32 dest_chain;
+};*/
 
 enum {
 	MLX5E_TC_FLOW_FLAG_INGRESS,
@@ -114,10 +117,7 @@ struct mlx5e_tc_flow {
 	refcount_t		refcnt;
 	struct rcu_head		rcu_head;
 	struct list_head        tunnel;  /* flows sharing the same tunnel match */
-	union {
-		struct mlx5_esw_flow_attr esw_attr[0];
-		struct mlx5_nic_flow_attr nic_attr[0];
-	};
+	struct mlx5_flow_attr	attr;
 };
 
 struct mlx5e_tc_flow_parse_attr {
@@ -195,6 +195,8 @@ struct mlx5e_hairpin {
 	struct mlx5e_rqt indir_rqt;
 	u32 indir_tirn[MLX5E_NUM_INDIR_TIRS];
 	struct mlx5e_ttc_table ttc;
+	u32 chain;
+	u16 prio;
 };
 
 struct mlx5e_hairpin_entry {
@@ -255,7 +257,8 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work);
 struct mlx5e_tc_flow *mlx5e_tc_get_flow(struct mlx5e_priv *priv,
 					int flags,
 					unsigned long cookie);
-int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1);
+extern int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0,
+				       u32 reg_c1);
 
 enum match_mapping_type {
 	mp_chain,
@@ -282,17 +285,25 @@ extern struct match_mapping_params *match_mappings;
 bool mlx5e_is_valid_eswitch_fwd_dev(struct mlx5e_priv *priv,
 				    struct net_device *out_dev);
 int get_direct_match_mapping(struct mlx5e_priv *priv,
-			     struct mlx5_esw_flow_attr *esw_attr,
+			     struct mlx5_flow_attr *esw_attr,
 			     enum match_mapping_type type,
 			     u32 data,
 			     u32 mask,
 			     bool rewrite);
 
+struct mlx5_flow_handle *
+mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
+			     struct mlx5_flow_spec *spec,
+			     struct mlx5_flow_attr *attr,
+			     struct mlx5e_tc_flow *flow);
+void mlx5e_del_offloaded_nic_rule(struct mlx5e_priv *priv,
+				  struct mlx5_flow_handle *rule,
+				  struct mlx5_flow_attr *attr);
 #else /* CONFIG_MLX5_ESWITCH */
 static inline int  mlx5e_tc_nic_init(struct mlx5e_priv *priv) { return 0; }
 static inline void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv) {}
 static inline int  mlx5e_tc_num_filters(struct mlx5e_priv *priv, int flags) { return 0; }
-static int mlx5e_update_skb(struct sk_buff *skb, u32 reg_c0, u32 reg_c1) { return 0; }
+static int __rcu (*tc_skb_update_hook)(struct sk_buff *skb, u32 reg_c0,
 #endif
 
 #endif /* __MLX5_EN_TC_H__ */

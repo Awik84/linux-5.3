@@ -4,6 +4,8 @@
 #ifndef __MLX5E_FLOW_STEER_H__
 #define __MLX5E_FLOW_STEER_H__
 
+#include "en_tc_chains.h"
+
 enum {
 	MLX5E_TC_FT_LEVEL = 0,
 	MLX5E_TC_TTC_FT_LEVEL,
@@ -18,6 +20,8 @@ struct mlx5e_tc_table {
 	DECLARE_HASHTABLE(hairpin_tbl, 8);
 
 	struct notifier_block     netdevice_nb;
+	struct mlx5_tc_chains_offload nic_chains;
+	struct mlx5e_ct_control *ct_control;
 };
 
 struct mlx5e_flow_table {
@@ -206,6 +210,12 @@ void mlx5e_set_ttc_basic_params(struct mlx5e_priv *priv, struct ttc_params *ttc_
 void mlx5e_set_ttc_ft_params(struct ttc_params *ttc_params);
 void mlx5e_set_inner_ttc_ft_params(struct ttc_params *ttc_params);
 
+int mlx5e_generate_ttc_table_rules(struct mlx5e_priv *priv,
+				   struct ttc_params *params,
+				   struct mlx5e_ttc_table *ttc);
+void mlx5e_cleanup_ttc_rules(struct mlx5e_ttc_table *ttc);
+int mlx5e_create_ttc_table_groups(struct mlx5e_ttc_table *ttc,
+				  bool use_ipv);
 int mlx5e_create_ttc_table(struct mlx5e_priv *priv, struct ttc_params *params,
 			   struct mlx5e_ttc_table *ttc);
 void mlx5e_destroy_ttc_table(struct mlx5e_priv *priv,
@@ -217,6 +227,7 @@ void mlx5e_destroy_inner_ttc_table(struct mlx5e_priv *priv,
 				   struct mlx5e_ttc_table *ttc);
 
 void mlx5e_destroy_flow_table(struct mlx5e_flow_table *ft);
+void mlx5e_destroy_groups(struct mlx5e_flow_table *ft);
 
 void mlx5e_enable_cvlan_filter(struct mlx5e_priv *priv);
 void mlx5e_disable_cvlan_filter(struct mlx5e_priv *priv);

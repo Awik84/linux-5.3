@@ -761,6 +761,7 @@ struct mlx5e_tir {
 
 enum {
 	MLX5E_TC_PRIO = 0,
+	MLX5E_TC_RESTORE_PRIO,
 	MLX5E_NIC_PRIO
 };
 

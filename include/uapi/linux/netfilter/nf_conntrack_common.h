@@ -105,6 +105,14 @@ enum ip_conntrack_status {
 	IPS_OFFLOAD_BIT = 14,
 	IPS_OFFLOAD = (1 << IPS_OFFLOAD_BIT),
 
+	/* Conntrack original direction has been offloaded to flow table. */
+	IPS_OFFLOAD_ORIG_BIT = 15,
+	IPS_OFFLOAD_ORIG = (1 << IPS_OFFLOAD_ORIG_BIT),
+
+	/* Conntrack reply direction has been offloaded to flow table. */
+	IPS_OFFLOAD_REPLY_BIT = 16,
+	IPS_OFFLOAD_REPLY = (1 << IPS_OFFLOAD_REPLY_BIT),
+
 	/* Be careful here, modifying these bits can make things messy,
 	 * so don't let users modify them directly.
 	 */

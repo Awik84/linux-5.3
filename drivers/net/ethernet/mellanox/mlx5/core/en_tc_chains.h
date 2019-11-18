@@ -99,4 +99,8 @@ mlx5_tc_chain_get_prio_table(struct mlx5_tc_chains_offload *offload,
 void
 mlx5_tc_chain_put_prio_table(struct mlx5_tc_chains_offload *offload,
 			     u32 chain, u32 prio, u32 level);
+void mlx5_destroy_restore_table(struct mlx5_tc_chains_offload *offload);
+int mlx5_create_restore_table(struct mlx5_tc_chains_offload *offload,
+			      enum mlx5_flow_namespace_type ns_type,
+			      u16 ft_prio);
 #endif

@@ -199,7 +199,7 @@ struct mlx5_flow_handle *
 mlx5_eswitch_add_termtbl_rule(struct mlx5_eswitch *esw,
 			      struct mlx5_flow_table *fdb,
 			      struct mlx5_flow_spec *spec,
-			      struct mlx5_esw_flow_attr *attr,
+			      struct mlx5_flow_attr *attr,
 			      struct mlx5_flow_act *flow_act,
 			      struct mlx5_flow_destination *dest,
 			      int num_dest)

@@ -278,7 +278,7 @@ int mlx5_eswitch_query_esw_vport_context(struct mlx5_eswitch *esw, u16 vport,
 					 void *out, int outlen);
 
 struct mlx5_flow_spec;
-struct mlx5_esw_flow_attr;
+struct mlx5_flow_attr;
 struct mlx5_termtbl_handle;
 
 bool
@@ -290,7 +290,7 @@ struct mlx5_flow_handle *
 mlx5_eswitch_add_termtbl_rule(struct mlx5_eswitch *esw,
 			      struct mlx5_flow_table *ft,
 			      struct mlx5_flow_spec *spec,
-			      struct mlx5_esw_flow_attr *attr,
+			      struct mlx5_flow_attr *attr,
 			      struct mlx5_flow_act *flow_act,
 			      struct mlx5_flow_destination *dest,
 			      int num_dest);
@@ -302,19 +302,19 @@ mlx5_eswitch_termtbl_put(struct mlx5_eswitch *esw,
 struct mlx5_flow_handle *
 mlx5_eswitch_add_offloaded_rule(struct mlx5_eswitch *esw,
 				struct mlx5_flow_spec *spec,
-				struct mlx5_esw_flow_attr *attr);
+				struct mlx5_flow_attr *attr);
 struct mlx5_flow_handle *
 mlx5_eswitch_add_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_spec *spec,
-			  struct mlx5_esw_flow_attr *attr);
+			  struct mlx5_flow_attr *attr);
 void
 mlx5_eswitch_del_offloaded_rule(struct mlx5_eswitch *esw,
 				struct mlx5_flow_handle *rule,
-				struct mlx5_esw_flow_attr *attr);
+				struct mlx5_flow_attr *attr);
 void
 mlx5_eswitch_del_fwd_rule(struct mlx5_eswitch *esw,
 			  struct mlx5_flow_handle *rule,
-			  struct mlx5_esw_flow_attr *attr);
+			  struct mlx5_flow_attr *attr);
 
 struct mlx5_flow_handle *
 mlx5_eswitch_create_vport_rx_rule(struct mlx5_eswitch *esw, u16 vport,
@@ -340,7 +340,7 @@ enum {
 	MLX5_ESW_DEST_ENCAP_VALID   = BIT(1),
 };
 
-struct mlx5_esw_flow_attr {
+struct mlx5_flow_attr {
 	struct mlx5_eswitch_rep *in_rep;
 	struct mlx5_core_dev	*in_mdev;
 	struct mlx5_core_dev    *counter_dev;
@@ -373,6 +373,9 @@ struct mlx5_esw_flow_attr {
 	uint32_t tunnel_id;
 	uint16_t ct_action;
 	struct mlx5e_tc_flow_parse_attr *parse_attr;
+	u32 flow_tag;
+	struct mlx5_flow_table	*hairpin_ft;
+	u32 hairpin_tirn;
 };
 
 int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,
@@ -390,9 +393,9 @@ int mlx5_devlink_eswitch_encap_mode_get(struct devlink *devlink,
 void *mlx5_eswitch_get_uplink_priv(struct mlx5_eswitch *esw, u8 rep_type);
 
 int mlx5_eswitch_add_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_esw_flow_attr *attr);
+				 struct mlx5_flow_attr *attr);
 int mlx5_eswitch_del_vlan_action(struct mlx5_eswitch *esw,
-				 struct mlx5_esw_flow_attr *attr);
+				 struct mlx5_flow_attr *attr);
 int __mlx5_eswitch_set_vport_vlan(struct mlx5_eswitch *esw,
 				  u16 vport, u16 vlan, u8 qos, u8 set_flags);
 

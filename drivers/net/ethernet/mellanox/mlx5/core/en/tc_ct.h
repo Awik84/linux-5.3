@@ -9,8 +9,8 @@
 #include "en.h"
 #include "en_rep.h"
 
-int mlx5e_ct_init(struct mlx5_rep_uplink_priv *uplink_priv);
-void mlx5e_ct_clean(struct mlx5_rep_uplink_priv *uplink_priv);
+int mlx5e_ct_init(struct mlx5e_priv *priv, struct mlx5e_ct_control **ct_control);
+void mlx5e_ct_clean(struct mlx5e_ct_control **ct_control);
 
 int mlx5e_ct_flow_offload(struct mlx5e_tc_flow *flow);
 void mlx5e_ct_delete_flow(struct mlx5e_tc_flow *flow);
@@ -24,7 +24,7 @@ int mlx5e_ct_parse_action(struct mlx5e_tc_flow *flow,
 int mlx5e_configure_ct(struct net_device *dev, struct mlx5e_priv *priv,
 		       struct flow_cls_offload *f, int flags);
 
-int mlx5e_ct_restore_flow(struct mlx5_rep_uplink_priv *uplink_privuplink_priv,
+int mlx5e_ct_restore_flow(struct mlx5e_ct_control *control,
 			  struct sk_buff *skb, u32 tupleid, int *tunnel_id);
 
 #define mp_statezone_mapping {\

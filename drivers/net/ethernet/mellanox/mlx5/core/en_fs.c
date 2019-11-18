@@ -642,7 +642,7 @@ void mlx5e_set_rx_mode_work(struct work_struct *work)
 	mlx5e_vport_context_update(priv);
 }
 
-static void mlx5e_destroy_groups(struct mlx5e_flow_table *ft)
+void mlx5e_destroy_groups(struct mlx5e_flow_table *ft)
 {
 	int i;
 
@@ -667,7 +667,7 @@ void mlx5e_destroy_flow_table(struct mlx5e_flow_table *ft)
 	ft->t = NULL;
 }
 
-static void mlx5e_cleanup_ttc_rules(struct mlx5e_ttc_table *ttc)
+void mlx5e_cleanup_ttc_rules(struct mlx5e_ttc_table *ttc)
 {
 	int i;
 
@@ -805,9 +805,9 @@ mlx5e_generate_ttc_rule(struct mlx5e_priv *priv,
 	return err ? ERR_PTR(err) : rule;
 }
 
-static int mlx5e_generate_ttc_table_rules(struct mlx5e_priv *priv,
-					  struct ttc_params *params,
-					  struct mlx5e_ttc_table *ttc)
+int mlx5e_generate_ttc_table_rules(struct mlx5e_priv *priv,
+				   struct ttc_params *params,
+				   struct mlx5e_ttc_table *ttc)
 {
 	struct mlx5_flow_destination dest = {};
 	struct mlx5_flow_handle **rules;
@@ -870,8 +870,8 @@ del_rules:
 					 MLX5E_INNER_TTC_GROUP2_SIZE +\
 					 MLX5E_INNER_TTC_GROUP3_SIZE)
 
-static int mlx5e_create_ttc_table_groups(struct mlx5e_ttc_table *ttc,
-					 bool use_ipv)
+int mlx5e_create_ttc_table_groups(struct mlx5e_ttc_table *ttc,
+				  bool use_ipv)
 {
 	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
 	struct mlx5e_flow_table *ft = &ttc->ft;
