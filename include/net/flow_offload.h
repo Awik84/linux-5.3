@@ -132,11 +132,13 @@ enum flow_action_id {
 	FLOW_ACTION_ADD,
 	FLOW_ACTION_CSUM,
 	FLOW_ACTION_MARK,
+	FLOW_ACTION_PRIO,
 	FLOW_ACTION_WAKE,
 	FLOW_ACTION_QUEUE,
 	FLOW_ACTION_SAMPLE,
 	FLOW_ACTION_POLICE,
 	FLOW_ACTION_CT,
+	FLOW_ACTION_PRIORITY,
 };
 
 /* This is mirroring enum pedit_header_type definition for easy mapping between
@@ -171,6 +173,7 @@ struct flow_action_entry {
 		const struct ip_tunnel_info *tunnel;	/* FLOW_ACTION_TUNNEL_ENCAP */
 		u32			csum_flags;	/* FLOW_ACTION_CSUM */
 		u32			mark;		/* FLOW_ACTION_MARK */
+		u32			prio;		/* FLOW_ACTION_PRIORITY */
 		struct {				/* FLOW_ACTION_QUEUE */
 			u32		ctx;
 			u32		index;
