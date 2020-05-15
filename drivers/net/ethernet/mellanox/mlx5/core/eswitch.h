@@ -376,6 +376,7 @@ struct mlx5_flow_attr {
 	u32 flow_tag;
 	struct mlx5_flow_table	*hairpin_ft;
 	u32 hairpin_tirn;
+	u16 user_prio;
 };
 
 int mlx5_devlink_eswitch_mode_set(struct devlink *devlink, u16 mode,

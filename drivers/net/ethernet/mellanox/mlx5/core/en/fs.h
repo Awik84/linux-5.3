@@ -6,22 +6,52 @@
 
 #include "en_tc_chains.h"
 
+#define MLX5E_TTC_NUM_GROUPS	3
+#define MLX5E_TTC_GROUP1_SIZE	(BIT(3) + MLX5E_NUM_TUNNEL_TT)
+#define MLX5E_TTC_GROUP2_SIZE	 BIT(1)
+#define MLX5E_TTC_GROUP3_SIZE	 BIT(0)
+#define MLX5E_TTC_TABLE_SIZE	(MLX5E_TTC_GROUP1_SIZE +\
+				 MLX5E_TTC_GROUP2_SIZE +\
+				 MLX5E_TTC_GROUP3_SIZE)
+
+#define MLX5E_INNER_TTC_NUM_GROUPS	3
+#define MLX5E_INNER_TTC_GROUP1_SIZE	BIT(3)
+#define MLX5E_INNER_TTC_GROUP2_SIZE	BIT(1)
+#define MLX5E_INNER_TTC_GROUP3_SIZE	BIT(0)
+#define MLX5E_INNER_TTC_TABLE_SIZE	(MLX5E_INNER_TTC_GROUP1_SIZE +\
+					 MLX5E_INNER_TTC_GROUP2_SIZE +\
+					 MLX5E_INNER_TTC_GROUP3_SIZE)
+
 enum {
 	MLX5E_TC_FT_LEVEL = 0,
 	MLX5E_TC_TTC_FT_LEVEL,
 };
 
+struct mlx5_prio_hp {
+	int rate;
+	struct kobject kobj;
+	struct mlx5e_priv *priv;
+	int prio;
+};
+
+#define MLX5E_MAX_HP_PRIO 1000
 struct mlx5e_tc_table {
 	struct mlx5_flow_table		*t;
 
 	struct rhashtable               ht;
 
 	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
-	DECLARE_HASHTABLE(hairpin_tbl, 8);
+	DECLARE_HASHTABLE(hairpin_tbl, 16);
 
 	struct notifier_block     netdevice_nb;
 	struct mlx5_tc_chains_offload nic_chains;
 	struct mlx5e_ct_control *ct_control;
+	struct kobject *hp_config;
+	struct mlx5_prio_hp *prio_hp;
+	int num_prio_hp;
+	atomic_t hp_fwd_ref_cnt;
+	struct mlx5_flow_table *hp_fwd;
+	struct mlx5_flow_group *hp_fwd_g;
 };
 
 struct mlx5e_flow_table {

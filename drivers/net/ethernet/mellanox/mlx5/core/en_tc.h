@@ -207,8 +207,9 @@ struct mlx5e_hairpin_entry {
 	struct list_head flows;
 
 	u16 peer_vhca_id;
-	u8 prio;
+	u16 prio;
 	struct mlx5e_hairpin *hp;
+	struct mlx5_flow_handle *fwd_rule;
 };
 
 struct mod_hdr_key {
@@ -268,6 +269,7 @@ enum match_mapping_type {
 	mp_statezone,
 	mp_mark,
 	mp_labels,
+	mp_user_prio,
 };
 
 struct match_mapping_params {
@@ -299,6 +301,11 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 void mlx5e_del_offloaded_nic_rule(struct mlx5e_priv *priv,
 				  struct mlx5_flow_handle *rule,
 				  struct mlx5_flow_attr *attr);
+int mlx5e_prio_hairpin_mode_enable(struct mlx5e_priv *priv, int num_hp);
+int mlx5e_prio_hairpin_mode_disable(struct mlx5e_priv *priv);
+int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
+				u16 prio, int rate);
+
 #else /* CONFIG_MLX5_ESWITCH */
 static inline int  mlx5e_tc_nic_init(struct mlx5e_priv *priv) { return 0; }
 static inline void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv) {}
