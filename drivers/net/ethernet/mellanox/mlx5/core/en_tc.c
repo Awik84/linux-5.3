@@ -534,7 +534,7 @@ struct mlx5e_hairpin_entry *mlx5e_get_hairpin_entry(struct mlx5e_priv *priv,
 		return ERR_CAST(hp);
 	}
 
-	netdev_dbg(priv->netdev, "add hairpin: tirn %x rqn %x peer %s sqn %x prio %d (log) data %d packets %d\n",
+	netdev_warn(priv->netdev, "add hairpin: tirn %x rqn %x peer %s sqn %x prio %d (log) data %d packets %d\n",
 		   hp->tirn, hp->pair->rqn[0],
 		   dev_name(hp->pair->peer_mdev->device),
 		   hp->pair->sqn[0], match_prio, params.log_data_size, params.log_num_packets);
@@ -629,7 +629,8 @@ static int mlx5e_prio_hairpin_init_queues(struct mlx5e_priv *priv)
 err_queues:
 	hash_for_each_safe(priv->fs.tc.hairpin_tbl, i, tmp,
 			  hpe, hairpin_hlist) {
-		mlx5_del_flow_rules(hpe->fwd_rule);
+		if (hpe->fwd_rule)
+			mlx5_del_flow_rules(hpe->fwd_rule);
 		mlx5e_hairpin_destroy(hpe->hp);
 		hash_del(&hpe->hairpin_hlist);
 		kfree(hpe);
@@ -642,6 +643,7 @@ static void mlx5e_prio_hairpin_destroy_queues(struct mlx5e_priv *priv)
 {
 	struct mlx5e_hairpin_entry *hpe;
 	struct mlx5_rate_limit rl = {0};
+	struct mlx5_core_dev *peer_dev;
 	struct hlist_node *tmp;
 	int i;
 
@@ -650,10 +652,11 @@ static void mlx5e_prio_hairpin_destroy_queues(struct mlx5e_priv *priv)
 		if (hpe->fwd_rule)
 			mlx5_del_flow_rules(hpe->fwd_rule);
 		rl.rate = hpe->hp->rate_limit;
+		peer_dev = hpe->hp->pair->peer_mdev;
 		mlx5e_hairpin_destroy(hpe->hp);
 
 		if (rl.rate)
-			mlx5_rl_remove_rate(priv->mdev, &rl);
+			mlx5_rl_remove_rate(peer_dev, &rl);
 
 		hash_del(&hpe->hairpin_hlist);
 		kfree(hpe);
@@ -685,6 +688,7 @@ int mlx5e_prio_hairpin_fwd_tbl_create(struct mlx5e_priv *priv, int num_hp)
 		goto out_free;
 	}
 
+	ft_attr.unmanaged = true;
 	ft_attr.max_fte = num_hp;
 	ft_attr.level = MLX5E_TC_TTC_FT_LEVEL;
 	ft_attr.prio = MLX5E_TC_PRIO;
@@ -712,7 +716,7 @@ int mlx5e_prio_hairpin_fwd_tbl_create(struct mlx5e_priv *priv, int num_hp)
 		goto err_group;
 	}
 
-	pr_err("created prio_hp forward2tir table size %d\n", ft_attr.max_fte);
+	//pr_err("created prio_hp forward2tir table size %d\n", ft_attr.max_fte);
 	tc->hp_fwd = ft;
 	tc->hp_fwd_g = g;
 	atomic_set(&tc->hp_fwd_ref_cnt, 0);
@@ -775,6 +779,7 @@ int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 
 	hp = hpe->hp;
 	if (hp->rate_limit) {
+		//pr_err("releasing current prio %d rl %d\n", prio, hp->rate_limit);
 		rl.rate = hp->rate_limit;
 		/* remove current rl index to free space to next ones */
 		mlx5_rl_remove_rate(peer_mdev, &rl);
@@ -783,6 +788,7 @@ int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 	hp->rate_limit = 0;
 
 	if (rate) {
+		//pr_err("trying to set rate %d to hp prio %d, sqn 0x%.8x\n", rate, prio, hp->pair->sqn[0]);
 		rl.rate = rate;
 		err = mlx5_rl_add_rate(peer_mdev, &rl_index, &rl);
 		if (err) {
@@ -858,10 +864,8 @@ int mlx5e_prio_hairpin_mode_enable(struct mlx5e_priv *priv, int num_hp)
 err_queues:
 	mlx5e_prio_hairpin_fwd_tbl_destroy(priv);
 err_sysfs:
-	for (i--; i >= 0; i--) {
-		pr_err("cleaning prio_hp kobj from %d\n", i);
+	for (i--; i >= 0; i--)
 		kobject_put(&tc->prio_hp[i].kobj);
-	}
 	kfree(tc->prio_hp);
 err_array:
 	kobject_put(tc->hp_config);
@@ -882,11 +886,12 @@ int mlx5e_prio_hairpin_mode_disable(struct mlx5e_priv *priv)
 		return -EBUSY;
 	}
 
-	pr_err("cleaning up %d prio hairpin queues, starting at %d\n", tc->num_prio_hp, i);
 	mlx5e_prio_hairpin_destroy_queues(priv);
 	for (; i >= 0; i--) {
 		kobject_put(&tc->prio_hp[i].kobj);
 	}
+
+	mlx5e_prio_hairpin_fwd_tbl_destroy(priv);
 	kfree(tc->prio_hp);
 	kobject_put(tc->hp_config);
 
@@ -987,7 +992,6 @@ mlx5e_add_offloaded_nic_rule(struct mlx5e_priv *priv,
 	if (flow_flag_test(flow, HAIRPIN)) {
 		flow_act.ignore_level = true;
 		if (tc->num_prio_hp) {
-			pr_err("Using prio_hp fwd table as rule destination\n");
 			dest[dest_ix].type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
 			dest[dest_ix].ft = tc->hp_fwd;
 		} else if (flow_flag_test(flow, HAIRPIN_RSS)) {
@@ -3284,6 +3288,7 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 
 			attr->user_prio = act->prio;
 			prio_set = true;
+			action |= MLX5_FLOW_CONTEXT_ACTION_MOD_HDR;
 			break;
 		default:
 			NL_SET_ERR_MSG_MOD(extack, "The offload action is not supported");
