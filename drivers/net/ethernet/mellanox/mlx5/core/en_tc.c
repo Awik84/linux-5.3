@@ -624,6 +624,8 @@ static int mlx5e_prio_hairpin_init_queues(struct mlx5e_priv *priv)
 		}
 	}
 
+	return 0;
+
 err_queues:
 	hash_for_each_safe(priv->fs.tc.hairpin_tbl, i, tmp,
 			  hpe, hairpin_hlist) {
@@ -639,13 +641,20 @@ err_queues:
 static void mlx5e_prio_hairpin_destroy_queues(struct mlx5e_priv *priv)
 {
 	struct mlx5e_hairpin_entry *hpe;
+	struct mlx5_rate_limit rl = {0};
 	struct hlist_node *tmp;
 	int i;
 
 	hash_for_each_safe(priv->fs.tc.hairpin_tbl, i, tmp,
 			  hpe, hairpin_hlist) {
-		mlx5_del_flow_rules(hpe->fwd_rule);
+		if (hpe->fwd_rule)
+			mlx5_del_flow_rules(hpe->fwd_rule);
+		rl.rate = hpe->hp->rate_limit;
 		mlx5e_hairpin_destroy(hpe->hp);
+
+		if (rl.rate)
+			mlx5_rl_remove_rate(priv->mdev, &rl);
+
 		hash_del(&hpe->hairpin_hlist);
 		kfree(hpe);
 	}
@@ -728,6 +737,79 @@ void mlx5e_prio_hairpin_fwd_tbl_destroy(struct mlx5e_priv *priv)
 	mlx5_destroy_flow_table(tc->hp_fwd);
 	tc->hp_fwd = NULL;
 }
+
+int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
+				u16 prio, int rate)
+{
+	struct mlx5_core_dev *mdev = priv->mdev;
+	struct mlx5e_modify_sq_param msp = {0};
+	struct mlx5e_hairpin_entry *hpe;
+	struct mlx5_rate_limit rl = {0};
+	struct mlx5_core_dev *peer_mdev;
+	struct mlx5e_hairpin *hp;
+	u16 rl_index = 0;
+	u16 match_prio;
+	int err;
+
+	peer_mdev = mlx5_get_next_phys_dev(mdev);
+	if (!peer_mdev) {
+		netdev_warn(priv->netdev, "Couldn't find peer dev to get hairpin queue entry\n");
+		return -EINVAL;
+	}
+
+	err = mlx5e_hairpin_get_prio(priv, NULL, prio, &match_prio,
+				     NULL);
+	if (err) {
+		netdev_warn(priv->netdev, "Set prio hairpin rate: Invalid hairpin priority %d\n",
+			    prio);
+		return -EINVAL;
+	}
+
+	hpe = mlx5e_get_hairpin_entry(priv, peer_mdev, match_prio);
+	if (IS_ERR(hpe)) {
+		err = PTR_ERR(hpe);
+		netdev_warn(priv->netdev, "Set prio hairpin rate: Can't find hairpin entry, err %d\n",
+			    err);
+		return err;
+	}
+
+	hp = hpe->hp;
+	if (hp->rate_limit) {
+		rl.rate = hp->rate_limit;
+		/* remove current rl index to free space to next ones */
+		mlx5_rl_remove_rate(peer_mdev, &rl);
+	}
+
+	hp->rate_limit = 0;
+
+	if (rate) {
+		rl.rate = rate;
+		err = mlx5_rl_add_rate(peer_mdev, &rl_index, &rl);
+		if (err) {
+			netdev_err(priv->netdev, "Failed configuring rate %u: %d\n",
+				   rate, err);
+			return err;
+		}
+	}
+
+	msp.curr_state = MLX5_SQC_STATE_RDY;
+	msp.next_state = MLX5_SQC_STATE_RDY;
+	msp.rl_index   = rl_index;
+	msp.rl_update  = true;
+	err = mlx5e_modify_sq(peer_mdev, hp->pair->sqn[0], &msp);
+	if (err) {
+		netdev_err(priv->netdev, "Failed configuring rate %u: %d\n",
+			   rate, err);
+		/* remove the rate from the table */
+		if (rate)
+			mlx5_rl_remove_rate(peer_mdev, &rl);
+		return err;
+	}
+
+	hp->rate_limit = rate;
+	return 0;
+}
+
 
 int mlx5e_prio_hairpin_mode_enable(struct mlx5e_priv *priv, int num_hp)
 {

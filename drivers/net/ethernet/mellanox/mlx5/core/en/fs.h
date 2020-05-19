@@ -31,7 +31,7 @@ struct mlx5_prio_hp {
 	int rate;
 	struct kobject kobj;
 	struct mlx5e_priv *priv;
-	int prio;
+	u16 prio;
 };
 
 #define MLX5E_MAX_HP_PRIO 1000

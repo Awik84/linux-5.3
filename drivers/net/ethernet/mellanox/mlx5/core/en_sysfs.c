@@ -86,17 +86,43 @@ static ssize_t rate_store(struct mlx5_prio_hp *g,
 			   size_t count)
 {
 	struct mlx5e_priv *priv = g->priv;
-	int rate;
+	struct mlx5_core_dev *mdev = priv->mdev;
+	int user_rate, rate;
+	int err;
 
-	if (sscanf(buf, "%d", &rate) != 1)
+	if (sscanf(buf, "%d", &user_rate) != 1)
 		return -EINVAL;
 
-	if (g->rate == rate)
+	if (user_rate == g->rate)
+		/* nothing to do */
 		return count;
 
-	g->rate = rate;
+	if (!mlx5_rl_is_supported(mdev)) {
+		netdev_err(priv->netdev, "Rate limiting is not supported on this device\n");
+		return -EINVAL;
+	}
 
-	/* Update rate limit of hp prio g->prio */
+	/* rate is given in Mb/sec, HW config is in Kb/sec */
+	rate = user_rate << 10;
+
+	/* Check whether rate in valid range, 0 is always valid */
+	if (rate && !mlx5_rl_is_in_range(mdev, rate)) {
+		netdev_err(priv->netdev, "TX rate %u, is not in range\n", rate);
+		return -ERANGE;
+	}
+
+	mutex_lock(&priv->state_lock);
+	if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+		err = mlx5e_set_prio_hairpin_rate(priv, g->prio, rate);
+	if (err) {
+		mutex_unlock(&priv->state_lock);
+
+		return err;
+	}
+
+	g->rate = user_rate;
+	mutex_unlock(&priv->state_lock);
+
 	return count;
 }
 
