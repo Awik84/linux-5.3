@@ -2458,6 +2458,13 @@ static struct match_mapping_params match_mappings_arr[] = {
 	[mp_statezone] = mp_statezone_mapping,
 	[mp_mark] = mp_mark_mapping,
 	[mp_labels] = mp_labels_mapping,
+	[mp_user_prio] = {
+		.mfield = MLX5_ACTION_IN_FIELD_METADATA_REG_C_5,
+		.moffset = 0,
+		.mlen = 4,
+		.soffset = MLX5_BYTE_OFF(fte_match_param,
+					 misc_parameters_2.metadata_reg_c_5),
+	},
 };
 
 struct match_mapping_params *match_mappings = match_mappings_arr;
@@ -2802,9 +2809,10 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 {
 	struct mlx5_flow_attr *attr = &flow->attr;
 	struct mlx5_tc_chains_offload *nic_chains =
-			&priv->fs.tc.nic_chains;
+				&tc->nic_chains;
 	struct pedit_headers_action hdrs[2] = {};
 	const struct flow_action_entry *act;
+	bool prio_set = false;
 	u32 action = 0;
 	int err, i;
 
@@ -2900,6 +2908,15 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 			flow_flag_set(flow, CT);
 			}
 			break;
+		case FLOW_ACTION_PRIORITY:
+			if (act->prio > tc->num_prio_hp) {
+				NL_SET_ERR_MSG_MOD(extack, "Skb priority value is out of range");
+				return -EINVAL;
+			}
+
+			attr->user_prio = act->prio;
+			prio_set = true;
+			break;
 		default:
 			NL_SET_ERR_MSG_MOD(extack, "The offload action is not supported");
 			return -EOPNOTSUPP;
@@ -2921,7 +2938,14 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 		}
 	}
 
-	attr->action = action;
+	if (prio_set) {
+		err = get_direct_match_mapping(priv, attr, mp_user_prio,
+					       attr->user_prio, 0xFFFFFFFF, true);
+		if (err) {
+			netdev_warn(priv->netdev, "Failed to user prio in modify_hdr, err %d\n", err);
+			return err;
+		}
+	}
 
 	if (attr->dest_chain) {
 		if (attr->action & MLX5_FLOW_CONTEXT_ACTION_FWD_DEST) {
