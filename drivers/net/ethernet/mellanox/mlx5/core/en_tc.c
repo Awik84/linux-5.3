@@ -503,11 +503,12 @@ struct mlx5e_hairpin_entry *mlx5e_get_hairpin_entry(struct mlx5e_priv *priv,
 	hpe->peer_vhca_id = peer_id;
 	hpe->prio = match_prio;
 
-	params.log_data_size = 15;
+/*	params.log_data_size = 15;
 	params.log_data_size = min_t(u8, params.log_data_size,
 				     MLX5_CAP_GEN(priv->mdev, log_max_hairpin_wq_data_sz));
 	params.log_data_size = max_t(u8, params.log_data_size,
-				     MLX5_CAP_GEN(priv->mdev, log_min_hairpin_wq_data_sz));
+				     MLX5_CAP_GEN(priv->mdev, log_min_hairpin_wq_data_sz));*/
+	params.log_data_size = MLX5_CAP_GEN(priv->mdev, log_max_hairpin_wq_data_sz);
 
 	//params.log_num_packets = params.log_data_size - 10;
 	params.log_num_packets = params.log_data_size -
