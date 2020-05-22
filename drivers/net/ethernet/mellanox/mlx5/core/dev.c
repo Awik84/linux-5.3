@@ -31,6 +31,7 @@
  */
 
 #include <linux/mlx5/driver.h>
+#include <linux/mlx5/vport.h>
 #include "mlx5_core.h"
 
 static LIST_HEAD(intf_list);
@@ -308,6 +309,19 @@ static u32 mlx5_gen_pci_id(struct mlx5_core_dev *dev)
 		     PCI_SLOT(dev->pdev->devfn));
 }
 
+static bool same_hw_devs(struct mlx5_core_dev *dev, struct mlx5_core_dev *peer_dev)
+{
+	struct mlx5_core_dev *fmdev, *pmdev;
+	u64 fsystem_guid, psystem_guid;
+
+	fmdev = dev;
+	pmdev = peer_dev;
+
+	fsystem_guid = mlx5_query_nic_system_image_guid(fmdev);
+	psystem_guid = mlx5_query_nic_system_image_guid(pmdev);
+
+	return (fsystem_guid == psystem_guid);
+}
 /* Must be called with intf_mutex held */
 struct mlx5_core_dev *mlx5_get_next_phys_dev(struct mlx5_core_dev *dev)
 {
@@ -325,7 +339,8 @@ struct mlx5_core_dev *mlx5_get_next_phys_dev(struct mlx5_core_dev *dev)
 		if (!mlx5_core_is_pf(tmp_dev))
 			continue;
 
-		if ((dev != tmp_dev) && (mlx5_gen_pci_id(tmp_dev) == pci_id)) {
+		if ((dev != tmp_dev) && ((mlx5_gen_pci_id(tmp_dev) == pci_id) ||
+		    same_hw_devs(dev, tmp_dev))) {
 			res = tmp_dev;
 			break;
 		}
