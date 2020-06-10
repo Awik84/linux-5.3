@@ -746,6 +746,7 @@ void mlx5e_prio_hairpin_fwd_tbl_destroy(struct mlx5e_priv *priv)
 int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 				u16 prio, int rate)
 {
+	struct mlx5e_tc_table *tc = &priv->fs.tc;
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_modify_sq_param msp = {0};
 	struct mlx5e_hairpin_entry *hpe;
@@ -782,6 +783,7 @@ int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 	if (hp->rate_limit) {
 		//pr_err("releasing current prio %d rl %d\n", prio, hp->rate_limit);
 		rl.rate = hp->rate_limit;
+		rl.max_burst_sz = hp->max_pp_burst_size;
 		/* remove current rl index to free space to next ones */
 		mlx5_rl_remove_rate(peer_mdev, &rl);
 	}
@@ -791,6 +793,7 @@ int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 	if (rate) {
 		//pr_err("trying to set rate %d to hp prio %d, sqn 0x%.8x\n", rate, prio, hp->pair->sqn[0]);
 		rl.rate = rate;
+		rl.max_burst_sz = tc->max_pp_burst_size;
 		err = mlx5_rl_add_rate(peer_mdev, &rl_index, &rl);
 		if (err) {
 			netdev_err(priv->netdev, "Failed configuring rate %u: %d\n",
@@ -814,6 +817,7 @@ int mlx5e_set_prio_hairpin_rate(struct mlx5e_priv *priv,
 	}
 
 	hp->rate_limit = rate;
+	hp->max_pp_burst_size = rate ? tc->max_pp_burst_size : 0;
 	return 0;
 }
 

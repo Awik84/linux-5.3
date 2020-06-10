@@ -221,21 +221,68 @@ static ssize_t prio_hp_num_show(struct device *device, struct device_attribute *
 	return result;
 }
 
+#define MLX5E_MAX_HP_PP_BURST_SIZE (30 * 1514)
+static ssize_t pp_burst_size_store(struct device *device, struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct mlx5e_priv *priv = netdev_priv(to_net_dev(device));
+	struct mlx5e_tc_table *tc = &priv->fs.tc;
+	int burst_size;
+	int err;
+
+	err = sscanf(buf, "%d", &burst_size);
+	if (err != 1)
+		return -EINVAL;
+
+	if (burst_size < 0 || burst_size > MLX5E_MAX_HP_PP_BURST_SIZE)
+		return -EINVAL;
+
+	rtnl_lock();
+	mutex_lock(&priv->state_lock);
+
+	tc->max_pp_burst_size = burst_size;
+
+	mutex_unlock(&priv->state_lock);
+	rtnl_unlock();
+
+	return count;
+}
+
+static ssize_t pp_burst_size_show(struct device *device, struct device_attribute *attr,
+				  char *buf)
+{
+	struct mlx5e_priv *priv = netdev_priv(to_net_dev(device));
+	struct mlx5e_tc_table *tc = &priv->fs.tc;
+	ssize_t result;
+
+
+	mutex_lock(&priv->state_lock);
+	result = sprintf(buf, "%d\n", tc->max_pp_burst_size);
+	mutex_unlock(&priv->state_lock);
+
+	return result;
+}
+
 static DEVICE_ATTR(num_prio_hp, S_IRUGO | S_IWUSR,
 		   prio_hp_num_show, prio_hp_num_store);
+static DEVICE_ATTR(hp_pp_burst_size, S_IRUGO | S_IWUSR,
+		   pp_burst_size_show, pp_burst_size_store);
 
 static struct device_attribute *mlx5_class_attributes[] = {
 	&dev_attr_num_prio_hp,
+	&dev_attr_hp_pp_burst_size,
 };
 
 int mlx5e_tc_sysfs_init(struct mlx5e_priv *priv)
 {
 	struct device *device = &priv->netdev->dev;
-	int err;
+	int i, err;
 
-	err = device_create_file(device, mlx5_class_attributes[0]);
-	if (err)
-		return err;
+	for (i = 0; i < ARRAY_SIZE(mlx5_class_attributes); i++) {
+		err = device_create_file(device, mlx5_class_attributes[i]);
+		if (err)
+			return err;
+	}
 
 	return 0;
 }
@@ -243,6 +290,8 @@ int mlx5e_tc_sysfs_init(struct mlx5e_priv *priv)
 void mlx5e_tc_sysfs_cleanup(struct mlx5e_priv *priv)
 {
 	struct device *device = &priv->netdev->dev;
+	int i;
 
-	device_remove_file(device, mlx5_class_attributes[0]);
+	for (i = 0; i < ARRAY_SIZE(mlx5_class_attributes); i++)
+		device_remove_file(device, mlx5_class_attributes[i]);
 }

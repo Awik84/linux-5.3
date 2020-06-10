@@ -49,6 +49,7 @@ struct mlx5e_tc_table {
 	struct kobject *hp_config;
 	struct mlx5_prio_hp *prio_hp;
 	int num_prio_hp;
+	int max_pp_burst_size;
 	atomic_t hp_fwd_ref_cnt;
 	struct mlx5_flow_table *hp_fwd;
 	struct mlx5_flow_group *hp_fwd_g;

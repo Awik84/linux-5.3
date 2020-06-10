@@ -196,6 +196,7 @@ struct mlx5e_hairpin {
 	u32 indir_tirn[MLX5E_NUM_INDIR_TIRS];
 	struct mlx5e_ttc_table ttc;
 	u32 rate_limit;
+	u32 max_pp_burst_size;
 	u32 chain;
 	u16 prio;
 };
